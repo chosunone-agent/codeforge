@@ -43,13 +43,9 @@ local function on_message(data)
   local msg_type = message.type
 
   if msg_type == "connected" then
-    -- Initial connection, contains brief suggestion list
-    -- Request full details for each suggestion
-    if message.suggestions then
-      for _, brief in ipairs(message.suggestions) do
-        handle_suggestion_brief(brief)
-      end
-    end
+    -- Initial connection - server no longer sends suggestions automatically
+    -- We need to subscribe and then request the list
+    vim.notify("[codeforge] Connected to server", vim.log.levels.INFO)
 
   elseif msg_type == "suggestion.ready" then
     -- New suggestion available (should have full details)
@@ -89,6 +85,11 @@ local function on_message(data)
       elseif message.suggestion then
         -- Response to get command - this has full details
         store.add_suggestion(message.suggestion)
+      elseif message.subscribed then
+        -- Successfully subscribed to working directory
+        vim.notify(string.format("[codeforge] Subscribed to: %s", message.subscribed), vim.log.levels.INFO)
+        -- Request the list of suggestions for this directory
+        actions.request_list()
       end
     else
       vim.notify(
@@ -192,6 +193,26 @@ function M.setup(opts)
   local cwd = vim.fn.getcwd()
   ui.set_working_dir(cwd)
   actions.set_working_dir(cwd)
+  
+  -- Setup shadow buffer save callback
+  local shadow = require("codeforge.ui.shadow")
+  shadow.set_working_dir(cwd)
+  shadow.set_on_save_callback(function(modified_diff, hunk)
+    local success
+    if modified_diff then
+      -- User modified the buffer - apply modified version
+      success = actions.modify_current(modified_diff)
+    else
+      -- User saved without modifying - accept AI's change as-is
+      success = actions.accept_current()
+    end
+    if success then
+      -- Close CodeForge UI entirely, returning to the original buffer
+      -- (which now has the changes applied)
+      ui.close()
+    end
+    return success
+  end)
   
   -- Setup diagnostics and code actions
   local diagnostics = require("codeforge.diagnostics")

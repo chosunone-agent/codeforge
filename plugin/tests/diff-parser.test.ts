@@ -4,7 +4,9 @@ import {
   fileDiffsToHunks,
   getFilesFromDiff,
   extractHunkContent,
+  filterFileDiffs,
   type FileDiff,
+  type FilterOptions,
 } from "../src/diff-parser.ts";
 
 describe("parseDiff", () => {
@@ -355,5 +357,227 @@ describe("extractHunkContent", () => {
 
     expect(result.original).toEqual(["line1", "line2"]);
     expect(result.modified).toEqual(["line1", "line2 modified"]);
+  });
+});
+
+describe("filterFileDiffs", () => {
+  const sampleFileDiffs: FileDiff[] = [
+    {
+      oldPath: "src/components/Button.tsx",
+      newPath: "src/components/Button.tsx",
+      hunks: [
+        { oldStart: 10, oldCount: 5, newStart: 10, newCount: 7, content: "@@ -10,5 +10,7 @@\n..." },
+        { oldStart: 50, oldCount: 3, newStart: 52, newCount: 4, content: "@@ -50,3 +52,4 @@\n..." },
+      ],
+    },
+    {
+      oldPath: "src/utils/helpers.ts",
+      newPath: "src/utils/helpers.ts",
+      hunks: [
+        { oldStart: 1, oldCount: 3, newStart: 1, newCount: 4, content: "@@ -1,3 +1,4 @@\n..." },
+      ],
+    },
+    {
+      oldPath: "tests/Button.test.tsx",
+      newPath: "tests/Button.test.tsx",
+      hunks: [
+        { oldStart: 20, oldCount: 10, newStart: 20, newCount: 12, content: "@@ -20,10 +20,12 @@\n..." },
+      ],
+    },
+    {
+      oldPath: "docs/README.md",
+      newPath: "docs/README.md",
+      hunks: [
+        { oldStart: 5, oldCount: 2, newStart: 5, newCount: 3, content: "@@ -5,2 +5,3 @@\n..." },
+      ],
+    },
+  ];
+
+  test("returns all files when no filters specified", () => {
+    const result = filterFileDiffs(sampleFileDiffs, {});
+    expect(result).toHaveLength(4);
+  });
+
+  test("filters by exact file path (include)", () => {
+    const options: FilterOptions = {
+      includeFiles: ["src/utils/helpers.ts"],
+    };
+    const result = filterFileDiffs(sampleFileDiffs, options);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]!.newPath).toBe("src/utils/helpers.ts");
+  });
+
+  test("filters by glob pattern with single wildcard", () => {
+    const options: FilterOptions = {
+      includeFiles: ["src/components/*.tsx"],
+    };
+    const result = filterFileDiffs(sampleFileDiffs, options);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]!.newPath).toBe("src/components/Button.tsx");
+  });
+
+  test("filters by glob pattern with double wildcard", () => {
+    const options: FilterOptions = {
+      includeFiles: ["src/**/*.ts"],
+    };
+    const result = filterFileDiffs(sampleFileDiffs, options);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]!.newPath).toBe("src/utils/helpers.ts");
+  });
+
+  test("filters by glob pattern matching multiple extensions", () => {
+    const options: FilterOptions = {
+      includeFiles: ["**/*.tsx"],
+    };
+    const result = filterFileDiffs(sampleFileDiffs, options);
+
+    expect(result).toHaveLength(2);
+    expect(result.map(f => f.newPath)).toContain("src/components/Button.tsx");
+    expect(result.map(f => f.newPath)).toContain("tests/Button.test.tsx");
+  });
+
+  test("excludes files by exact path", () => {
+    const options: FilterOptions = {
+      excludeFiles: ["docs/README.md"],
+    };
+    const result = filterFileDiffs(sampleFileDiffs, options);
+
+    expect(result).toHaveLength(3);
+    expect(result.map(f => f.newPath)).not.toContain("docs/README.md");
+  });
+
+  test("excludes files by glob pattern", () => {
+    const options: FilterOptions = {
+      excludeFiles: ["**/*.test.tsx"],
+    };
+    const result = filterFileDiffs(sampleFileDiffs, options);
+
+    expect(result).toHaveLength(3);
+    expect(result.map(f => f.newPath)).not.toContain("tests/Button.test.tsx");
+  });
+
+  test("combines include and exclude filters", () => {
+    const options: FilterOptions = {
+      includeFiles: ["**/*.tsx"],
+      excludeFiles: ["**/*.test.tsx"],
+    };
+    const result = filterFileDiffs(sampleFileDiffs, options);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]!.newPath).toBe("src/components/Button.tsx");
+  });
+
+  test("filters hunks by line range - single hunk", () => {
+    const options: FilterOptions = {
+      lineRanges: [
+        { file: "src/components/Button.tsx", startLine: 8, endLine: 15 },
+      ],
+    };
+    const result = filterFileDiffs(sampleFileDiffs, options);
+
+    // Only the file with the line range filter should have filtered hunks
+    const buttonFile = result.find(f => f.newPath === "src/components/Button.tsx");
+    expect(buttonFile).toBeDefined();
+    expect(buttonFile!.hunks).toHaveLength(1);
+    expect(buttonFile!.hunks[0]!.newStart).toBe(10); // Only the first hunk overlaps with 8-15
+
+    // Other files should have all their hunks
+    const helpersFile = result.find(f => f.newPath === "src/utils/helpers.ts");
+    expect(helpersFile).toBeDefined();
+    expect(helpersFile!.hunks).toHaveLength(1);
+  });
+
+  test("filters hunks by line range - both hunks match", () => {
+    const options: FilterOptions = {
+      lineRanges: [
+        { file: "src/components/Button.tsx", startLine: 1, endLine: 100 },
+      ],
+    };
+    const result = filterFileDiffs(sampleFileDiffs, options);
+
+    const buttonFile = result.find(f => f.newPath === "src/components/Button.tsx");
+    expect(buttonFile).toBeDefined();
+    expect(buttonFile!.hunks).toHaveLength(2); // Both hunks are in range 1-100
+  });
+
+  test("filters hunks by line range - no hunks match", () => {
+    const options: FilterOptions = {
+      lineRanges: [
+        { file: "src/components/Button.tsx", startLine: 100, endLine: 200 },
+      ],
+    };
+    const result = filterFileDiffs(sampleFileDiffs, options);
+
+    // The Button file should be removed since no hunks match
+    const buttonFile = result.find(f => f.newPath === "src/components/Button.tsx");
+    expect(buttonFile).toBeUndefined();
+
+    // Other files should still be present with all hunks
+    expect(result).toHaveLength(3);
+  });
+
+  test("handles multiple line ranges for same file", () => {
+    const options: FilterOptions = {
+      lineRanges: [
+        { file: "src/components/Button.tsx", startLine: 10, endLine: 12 },
+        { file: "src/components/Button.tsx", startLine: 50, endLine: 55 },
+      ],
+    };
+    const result = filterFileDiffs(sampleFileDiffs, options);
+
+    const buttonFile = result.find(f => f.newPath === "src/components/Button.tsx");
+    expect(buttonFile).toBeDefined();
+    expect(buttonFile!.hunks).toHaveLength(2); // Both hunks match their respective ranges
+  });
+
+  test("combines file filter with line range filter", () => {
+    const options: FilterOptions = {
+      includeFiles: ["src/**/*"],
+      lineRanges: [
+        { file: "src/components/Button.tsx", startLine: 48, endLine: 60 },
+      ],
+    };
+    const result = filterFileDiffs(sampleFileDiffs, options);
+
+    // Should include both src files
+    expect(result).toHaveLength(2);
+
+    // Button file should only have the second hunk (lines 52-55)
+    const buttonFile = result.find(f => f.newPath === "src/components/Button.tsx");
+    expect(buttonFile!.hunks).toHaveLength(1);
+    expect(buttonFile!.hunks[0]!.newStart).toBe(52);
+
+    // helpers file should have all hunks (no line range filter for it)
+    const helpersFile = result.find(f => f.newPath === "src/utils/helpers.ts");
+    expect(helpersFile!.hunks).toHaveLength(1);
+  });
+
+  test("handles empty input", () => {
+    const result = filterFileDiffs([], { includeFiles: ["**/*.ts"] });
+    expect(result).toHaveLength(0);
+  });
+
+  test("handles empty include patterns", () => {
+    const result = filterFileDiffs(sampleFileDiffs, { includeFiles: [] });
+    expect(result).toHaveLength(4); // Empty array means include all
+  });
+
+  test("glob pattern with question mark", () => {
+    const fileDiffs: FileDiff[] = [
+      { oldPath: "src/a.ts", newPath: "src/a.ts", hunks: [] },
+      { oldPath: "src/ab.ts", newPath: "src/ab.ts", hunks: [] },
+      { oldPath: "src/abc.ts", newPath: "src/abc.ts", hunks: [] },
+    ];
+
+    const options: FilterOptions = {
+      includeFiles: ["src/?.ts"],
+    };
+    const result = filterFileDiffs(fileDiffs, options);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]!.newPath).toBe("src/a.ts");
   });
 });

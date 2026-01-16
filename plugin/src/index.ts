@@ -11,22 +11,93 @@
  */
 
 import { tool, type Plugin } from "@opencode-ai/plugin";
+import { existsSync, readFileSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
 // Server type from Bun.serve()
 import { SuggestionStore, generateSuggestionId } from "./suggestion-store.ts";
 import { SuggestionEventEmitter } from "./event-emitter.ts";
-import { parseDiff, fileDiffsToHunks, getFilesFromDiff } from "./diff-parser.ts";
+import { parseDiff, fileDiffsToHunks, filterFileDiffs, type FilterOptions } from "./diff-parser.ts";
 import { applyHunkToFile, applyModifiedHunk, reverseHunk } from "./patch-applier.ts";
 import { createHttpServer } from "./http-server.ts";
 import type { HunkFeedback, PublishSuggestionResult, FeedbackResult } from "./types.ts";
 
-// Configuration
-const HTTP_SERVER_PORT = parseInt(process.env.SUGGESTION_MANAGER_PORT ?? "4097", 10);
-const HTTP_SERVER_HOST = process.env.SUGGESTION_MANAGER_HOST ?? "127.0.0.1";
+/**
+ * CodeForge configuration schema
+ * 
+ * Config is loaded from (in order of precedence, later overrides earlier):
+ * 1. Default values
+ * 2. Global config: ~/.config/opencode/codeforge.json
+ * 3. Project config: .opencode/codeforge.json
+ * 4. Environment variables (highest precedence)
+ */
+export interface CodeForgeConfig {
+  server?: {
+    enabled?: boolean;
+    port?: number;
+    host?: string;
+  };
+}
+
+/**
+ * Load and merge configuration from all sources
+ */
+export function loadConfig(projectDir: string): { enabled: boolean; port: number; host: string } {
+  // Defaults
+  let enabled = true;
+  let port = 4097;
+  let host = "127.0.0.1";
+
+  // Helper to load JSON config file
+  const loadJsonConfig = (path: string): CodeForgeConfig | null => {
+    try {
+      if (existsSync(path)) {
+        const content = readFileSync(path, "utf-8");
+        return JSON.parse(content) as CodeForgeConfig;
+      }
+    } catch (error) {
+      console.warn(`[codeforge] Failed to load config from ${path}:`, error);
+    }
+    return null;
+  };
+
+  // 1. Global config: ~/.config/opencode/codeforge.json
+  const globalConfigPath = join(homedir(), ".config", "opencode", "codeforge.json");
+  const globalConfig = loadJsonConfig(globalConfigPath);
+  if (globalConfig?.server) {
+    if (globalConfig.server.enabled !== undefined) enabled = globalConfig.server.enabled;
+    if (globalConfig.server.port !== undefined) port = globalConfig.server.port;
+    if (globalConfig.server.host !== undefined) host = globalConfig.server.host;
+  }
+
+  // 2. Project config: .opencode/codeforge.json
+  const projectConfigPath = join(projectDir, ".opencode", "codeforge.json");
+  const projectConfig = loadJsonConfig(projectConfigPath);
+  if (projectConfig?.server) {
+    if (projectConfig.server.enabled !== undefined) enabled = projectConfig.server.enabled;
+    if (projectConfig.server.port !== undefined) port = projectConfig.server.port;
+    if (projectConfig.server.host !== undefined) host = projectConfig.server.host;
+  }
+
+  // 3. Environment variables (highest precedence)
+  if (process.env.CODEFORGE_SERVER_ENABLED !== undefined) {
+    enabled = process.env.CODEFORGE_SERVER_ENABLED !== "false";
+  }
+  if (process.env.CODEFORGE_SERVER_PORT !== undefined) {
+    const envPort = parseInt(process.env.CODEFORGE_SERVER_PORT, 10);
+    if (!isNaN(envPort)) port = envPort;
+  }
+  if (process.env.CODEFORGE_SERVER_HOST !== undefined) {
+    host = process.env.CODEFORGE_SERVER_HOST;
+  }
+
+  return { enabled, port, host };
+}
 
 // Global state (persists across tool calls within a session)
-let store: SuggestionStore;
-let emitter: SuggestionEventEmitter;
-let workingDirectory: string;
+// Map of working directory -> store to support multiple projects
+const stores = new Map<string, SuggestionStore>();
+const emitters = new Map<string, SuggestionEventEmitter>();
 let httpServer: ReturnType<typeof Bun.serve> | null = null;
 
 /**
@@ -58,18 +129,77 @@ async function getCurrentChangeId($: any): Promise<string> {
  * The main plugin export
  */
 export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
-  // Initialize global state
-  store = new SuggestionStore({
-    feedbackLogPath: `${directory}/.opencode/suggestion-feedback.jsonl`,
-  });
-  emitter = new SuggestionEventEmitter(client);
-  workingDirectory = directory;
+  // Validate and normalize directory parameter
+  let workingDir = directory;
+  if (!directory || directory.trim() === "" || directory === "/") {
+    // Use home directory as fallback
+    workingDir = process.env.HOME || process.env.USERPROFILE || "/tmp";
+    console.warn(`[codeforge] Invalid working directory "${directory}", using fallback: ${workingDir}`);
+  }
 
-  // Start the HTTP server for direct editor communication
-  httpServer = createHttpServer(
-    { port: HTTP_SERVER_PORT, host: HTTP_SERVER_HOST },
-    { store, emitter, workingDirectory, client }
-  );
+  // Load configuration from files and environment
+  const config = loadConfig(workingDir);
+  
+  // Initialize or get existing store for this working directory
+  let store = stores.get(workingDir);
+  if (!store) {
+    try {
+      store = new SuggestionStore({
+        dbPath: `${workingDir}/.opencode/codeforge.db`,
+        feedbackLogPath: `${workingDir}/.opencode/suggestion-feedback.jsonl`,
+      });
+      stores.set(workingDir, store);
+      console.log(`[codeforge] Database initialized for ${workingDir}`);
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      console.error(`[codeforge] Failed to initialize database:`, errorMsg);
+      console.error(`[codeforge] Database path: ${workingDir}/.opencode/codeforge.db`);
+      throw new Error(`Database initialization failed: ${errorMsg}. Working directory: ${workingDir}`);
+    }
+  } else {
+    console.log(`[codeforge] Reusing existing database for ${workingDir}`);
+  }
+  
+  // Initialize or get existing emitter for this working directory
+  let emitter = emitters.get(workingDir);
+  if (!emitter) {
+    emitter = new SuggestionEventEmitter(client);
+    emitters.set(workingDir, emitter);
+  }
+
+  // Start the HTTP server for direct editor communication (if enabled)
+  if (config.enabled) {
+    // Check if server is already running (plugin may be loaded multiple times)
+    if (httpServer) {
+      console.log(`[codeforge] HTTP server already running on ${config.host}:${config.port}`);
+    } else {
+      try {
+        httpServer = createHttpServer(
+          { port: config.port, host: config.host },
+          { stores, emitters, client }
+        );
+        console.log(`[codeforge] HTTP server started on ${config.host}:${config.port}`);
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        
+        // Check if it's a port-in-use error - this is common and not a real error
+        if (errorMsg.includes("EADDRINUSE") || errorMsg.includes("address already in use") || errorMsg.includes("Is port")) {
+          console.log(`[codeforge] Port ${config.port} is already in use. HTTP server not started.`);
+          console.log(`[codeforge] Plugin will continue without HTTP server - editor integration will not work.`);
+        } else {
+          // Other errors are more serious, log as error
+          console.error(`[codeforge] Failed to start HTTP server on port ${config.port}: ${errorMsg}`);
+        }
+        
+        // Don't throw - allow plugin to load without HTTP server
+        // Tools will still work, just no editor communication
+        httpServer = null;
+      }
+    }
+  } else {
+    console.log("[codeforge] HTTP server disabled via config");
+    httpServer = null;
+  }
 
   return {
     tool: {
@@ -77,13 +207,30 @@ export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
        * Publish current jj change as a suggestion for user review
        */
       publish_suggestion: tool({
-        description: "Publish current jj change as a suggestion for user review. Call this when you have made changes and want the user to review them hunk-by-hunk.",
+        description: "Publish current jj change as a suggestion for user review. Call this when you have made changes and want the user to review them hunk-by-hunk. Supports selective publishing by filtering files or line ranges.",
         args: {
           description: tool.schema.string().describe("Human-readable description of the changes"),
           change_id: tool.schema.string().optional().describe("jj change ID to publish (defaults to current change)"),
+          files: tool.schema.array(tool.schema.string()).optional().describe("File paths or glob patterns to include (e.g., ['src/**/*.ts', 'lib/utils.ts']). If omitted, includes all changed files."),
+          exclude_files: tool.schema.array(tool.schema.string()).optional().describe("File paths or glob patterns to exclude (e.g., ['**/*.test.ts', 'docs/**'])"),
+          line_ranges: tool.schema.array(
+            tool.schema.object({
+              file: tool.schema.string().describe("File path to apply line range filter"),
+              start_line: tool.schema.number().describe("Start line number (inclusive)"),
+              end_line: tool.schema.number().describe("End line number (inclusive)"),
+            })
+          ).optional().describe("Filter hunks to only include those overlapping with specified line ranges"),
         },
         async execute(args): Promise<string> {
           try {
+            // Check database health
+            if (!store.isDbHealthy()) {
+              return JSON.stringify({
+                success: false,
+                error: `Database is not accessible. Path: ${store.getDbPath()}`,
+              });
+            }
+
             // Get the change ID
             const changeId = args.change_id ?? await getCurrentChangeId($);
 
@@ -97,24 +244,42 @@ export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
               });
             }
 
-            // Parse the diff into hunks
-            const fileDiffs = parseDiff(diffText);
+            // Parse the diff into file diffs
+            let fileDiffs = parseDiff(diffText);
+            
+            // Apply filters if specified
+            const hasFilters = args.files || args.exclude_files || args.line_ranges;
+            if (hasFilters) {
+              const filterOptions: FilterOptions = {
+                includeFiles: args.files,
+                excludeFiles: args.exclude_files,
+                lineRanges: args.line_ranges?.map(r => ({
+                  file: r.file,
+                  startLine: r.start_line,
+                  endLine: r.end_line,
+                })),
+              };
+              fileDiffs = filterFileDiffs(fileDiffs, filterOptions);
+            }
+            
+            // Convert to hunks
             const suggestionId = generateSuggestionId();
             const hunks = fileDiffsToHunks(fileDiffs, suggestionId);
-            const files = getFilesFromDiff(diffText);
+            const files = [...new Set(fileDiffs.map(fd => fd.newPath !== "/dev/null" ? fd.newPath : fd.oldPath))];
 
             if (hunks.length === 0) {
+              const filterMsg = hasFilters ? " (after applying filters)" : "";
               return JSON.stringify({
                 success: false,
-                error: "No hunks found in diff",
+                error: `No hunks found in diff${filterMsg}`,
               });
             }
 
             // Create the suggestion with relative working directory (relative to home)
             const homeDir = process.env.HOME || process.env.USERPROFILE || "";
-            const relativeWorkingDir = workingDirectory.startsWith(homeDir) 
-              ? workingDirectory.slice(homeDir.length + 1)  // +1 for the slash
-              : workingDirectory;
+            const relativeWorkingDir = workingDir.startsWith(homeDir) 
+              ? workingDir.slice(homeDir.length + 1)  // +1 for the slash
+              : workingDir;
             
             const suggestion = store.createSuggestion({
               id: suggestionId,
@@ -134,10 +299,11 @@ export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
               files,
             };
 
+            const filterInfo = hasFilters ? " (filtered)" : "";
             return JSON.stringify({
               success: true,
               ...result,
-              message: `Published suggestion with ${hunks.length} hunks in ${files.length} files`,
+              message: `Published suggestion with ${hunks.length} hunks in ${files.length} files${filterInfo}`,
             });
           } catch (error) {
             const errorMessage = error instanceof Error ? error.message : String(error);
@@ -164,6 +330,15 @@ export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
         },
         async execute(args): Promise<string> {
           try {
+            // Check database health
+            if (!store.isDbHealthy()) {
+              return JSON.stringify({
+                success: false,
+                error: `Database is not accessible. Path: ${store.getDbPath()}`,
+                applied: false,
+              });
+            }
+
             const suggestion = store.getSuggestion(args.suggestion_id);
             if (!suggestion) {
               return JSON.stringify({
@@ -191,7 +366,7 @@ export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
             let applied = false;
             let reverted = false;
 
-            const filePath = `${workingDirectory}/${hunk.file}`;
+            const filePath = `${workingDir}/${hunk.file}`;
 
             if (args.action === "accept") {
               // Accept: hunk is already in working copy, nothing to do
@@ -317,7 +492,15 @@ export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
         args: {},
         async execute(): Promise<string> {
           try {
-            const result = store.listSuggestions();
+            // Check database health
+            if (!store.isDbHealthy()) {
+              return JSON.stringify({
+                success: false,
+                error: `Database is not accessible. Path: ${store.getDbPath()}`,
+              });
+            }
+
+            const result = store.listSuggestions(workingDir);
             
             // Also emit the list event for the editor
             await emitter.emitList(result.suggestions);
@@ -346,6 +529,14 @@ export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
         },
         async execute(args): Promise<string> {
           try {
+            // Check database health
+            if (!store.isDbHealthy()) {
+              return JSON.stringify({
+                success: false,
+                error: `Database is not accessible. Path: ${store.getDbPath()}`,
+              });
+            }
+
             const suggestion = store.getSuggestion(args.suggestion_id);
             if (!suggestion) {
               return JSON.stringify({
@@ -409,6 +600,14 @@ export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
         },
         async execute(args): Promise<string> {
           try {
+            // Check database health
+            if (!store.isDbHealthy()) {
+              return JSON.stringify({
+                success: false,
+                error: `Database is not accessible. Path: ${store.getDbPath()}`,
+              });
+            }
+
             const suggestion = store.getSuggestion(args.suggestion_id);
             if (!suggestion) {
               return JSON.stringify({
@@ -453,6 +652,10 @@ export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
         httpServer.stop();
         httpServer = null;
         console.log("[codeforge] HTTP server stopped");
+      }
+      if (store) {
+        store.close();
+        console.log("[codeforge] Database connection closed");
       }
     },
   };

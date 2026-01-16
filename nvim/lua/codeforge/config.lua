@@ -26,6 +26,7 @@ M.defaults = {
     reject_all = "<C-x>",       -- Reject all remaining hunks
   },
   auto_connect = true,          -- Connect to server on setup
+  debug = false,                -- Enable debug logging
 }
 
 ---@type CodeForgeConfig

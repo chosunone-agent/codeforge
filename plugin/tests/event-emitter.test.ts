@@ -2,7 +2,7 @@ import { describe, expect, test, mock } from "bun:test";
 import {
   SuggestionEventEmitter,
   parseLogEvent,
-  isSuggestionManagerLog,
+  isCodeForgeLog,
 } from "../src/event-emitter.ts";
 import type { Suggestion, SuggestionEvent } from "../src/types.ts";
 
@@ -42,7 +42,7 @@ describe("SuggestionEventEmitter", () => {
 
       expect(logCalls).toHaveLength(1);
       expect(logCalls[0]?.body).toEqual({
-        service: "suggestion-manager",
+        service: "codeforge",
         level: "info",
         message: JSON.stringify(event),
         extra: {
@@ -67,6 +67,7 @@ describe("SuggestionEventEmitter", () => {
         status: "pending",
         createdAt: Date.now(),
         hunkStates: new Map(),
+        workingDirectory: "/test/path",
       };
 
       await emitter.emitReady(suggestion);
@@ -244,13 +245,13 @@ describe("parseLogEvent", () => {
   });
 });
 
-describe("isSuggestionManagerLog", () => {
-  test("returns true for suggestion-manager service", () => {
-    expect(isSuggestionManagerLog("suggestion-manager")).toBe(true);
+describe("isCodeForgeLog", () => {
+  test("returns true for codeforge service", () => {
+    expect(isCodeForgeLog("codeforge")).toBe(true);
   });
 
   test("returns false for other services", () => {
-    expect(isSuggestionManagerLog("other-service")).toBe(false);
-    expect(isSuggestionManagerLog("")).toBe(false);
+    expect(isCodeForgeLog("other-service")).toBe(false);
+    expect(isCodeForgeLog("")).toBe(false);
   });
 });

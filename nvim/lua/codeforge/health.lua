@@ -83,9 +83,23 @@ function M.check()
   local host = opts.server.host
   local port = opts.server.port
 
-  -- Try HTTP health endpoint
+  -- Check working directory first (needed for health endpoint)
+  health.start("Project")
+  local cwd = vim.fn.getcwd()
+  local home = vim.fn.expand("~")
+  local relative_cwd = cwd
+  if cwd:sub(1, #home) == home then
+    relative_cwd = cwd:sub(#home + 2)
+  end
+  health.info(string.format("Working directory: %s", cwd))
+  health.info(string.format("Project identifier: %s", relative_cwd))
+
+  -- Try HTTP health endpoint with working directory
   local http_ok = false
-  local curl_handle = io.popen(string.format("curl -s -o /dev/null -w '%%{http_code}' --connect-timeout 2 http://%s:%d/health 2>/dev/null", host, port))
+  local encoded_cwd = relative_cwd:gsub("([^A-Za-z0-9%-_%.~])", function(c)
+    return string.format("%%%02X", string.byte(c))
+  end)
+  local curl_handle = io.popen(string.format("curl -s -o /dev/null -w '%%{http_code}' --connect-timeout 2 'http://%s:%d/health?workingDirectory=%s' 2>/dev/null", host, port, encoded_cwd))
   if curl_handle then
     local status = curl_handle:read("*a")
     curl_handle:close()
@@ -99,17 +113,6 @@ function M.check()
     health.error(string.format("Cannot connect to server at %s:%d", host, port))
     health.info("Make sure OpenCode is running with the suggestion-manager plugin")
   end
-
-  -- Check working directory
-  health.start("Project")
-  local cwd = vim.fn.getcwd()
-  local home = vim.fn.expand("~")
-  local relative_cwd = cwd
-  if cwd:sub(1, #home) == home then
-    relative_cwd = cwd:sub(#home + 2)
-  end
-  health.info(string.format("Working directory: %s", cwd))
-  health.info(string.format("Project identifier: %s", relative_cwd))
   
   -- Check diagnostics
   health.start("Diagnostics")

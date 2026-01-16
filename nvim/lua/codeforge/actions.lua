@@ -36,11 +36,20 @@ local function send_feedback(suggestion_id, hunk_id, action, modified_diff, comm
     return false
   end
 
+  -- Get relative working directory
+  local cwd = working_dir or vim.fn.getcwd()
+  local home = vim.fn.expand("~")
+  local relative_cwd = cwd
+  if cwd:sub(1, #home) == home then
+    relative_cwd = cwd:sub(#home + 2)  -- +2 to skip the trailing slash
+  end
+
   local message = {
     type = "feedback",
     suggestionId = suggestion_id,
     hunkId = hunk_id,
     action = action,
+    workingDirectory = relative_cwd,
   }
 
   if modified_diff then
@@ -276,10 +285,19 @@ function M.complete_suggestion(action)
     return false
   end
 
+  -- Get relative working directory
+  local cwd = working_dir or vim.fn.getcwd()
+  local home = vim.fn.expand("~")
+  local relative_cwd = cwd
+  if cwd:sub(1, #home) == home then
+    relative_cwd = cwd:sub(#home + 2)  -- +2 to skip the trailing slash
+  end
+
   ws_client:send_json({
     type = "complete",
     suggestionId = suggestion.id,
     action = action,
+    workingDirectory = relative_cwd,
   })
 
   store.remove_suggestion(suggestion.id)
@@ -304,7 +322,15 @@ function M.request_list()
     return
   end
 
-  ws_client:send_json({ type = "list" })
+  -- Get relative working directory
+  local cwd = working_dir or vim.fn.getcwd()
+  local home = vim.fn.expand("~")
+  local relative_cwd = cwd
+  if cwd:sub(1, #home) == home then
+    relative_cwd = cwd:sub(#home + 2)  -- +2 to skip the trailing slash
+  end
+
+  ws_client:send_json({ type = "list", workingDirectory = relative_cwd })
 end
 
 ---Request details of a specific suggestion
@@ -314,7 +340,15 @@ function M.request_suggestion(suggestion_id)
     return
   end
 
-  ws_client:send_json({ type = "get", suggestionId = suggestion_id })
+  -- Get relative working directory
+  local cwd = working_dir or vim.fn.getcwd()
+  local home = vim.fn.expand("~")
+  local relative_cwd = cwd
+  if cwd:sub(1, #home) == home then
+    relative_cwd = cwd:sub(#home + 2)  -- +2 to skip the trailing slash
+  end
+
+  ws_client:send_json({ type = "get", suggestionId = suggestion_id, workingDirectory = relative_cwd })
 end
 
 return M

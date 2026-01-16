@@ -142,7 +142,7 @@ export interface FeedbackLogEntry {
   hunkId: string;
   action: "accept" | "reject" | "modify";
   file: string;
-  originalDiff: string;
+  originalDiff?: string;
   modifiedDiff?: string;
   comment?: string;
   applied: boolean;

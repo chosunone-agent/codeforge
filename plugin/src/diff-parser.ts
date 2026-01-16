@@ -200,6 +200,103 @@ export function fileDiffsToHunks(fileDiffs: FileDiff[], suggestionId: string): H
 }
 
 /**
+ * Filter options for selective publishing
+ */
+export interface FilterOptions {
+  /** File paths or glob patterns to include (if empty, includes all) */
+  includeFiles?: string[];
+  /** File paths or glob patterns to exclude */
+  excludeFiles?: string[];
+  /** Filter hunks by line range within a specific file */
+  lineRanges?: {
+    file: string;
+    startLine: number;
+    endLine: number;
+  }[];
+}
+
+/**
+ * Check if a file path matches any of the given patterns
+ * Supports exact matches and simple glob patterns (* and **)
+ */
+function matchesPattern(filePath: string, patterns: string[]): boolean {
+  for (const pattern of patterns) {
+    // Exact match
+    if (filePath === pattern) {
+      return true;
+    }
+    
+    // Convert glob pattern to regex
+    const regexPattern = pattern
+      .replace(/\*\*/g, "{{GLOBSTAR}}")  // Temporarily replace **
+      .replace(/\*/g, "[^/]*")            // * matches anything except /
+      .replace(/{{GLOBSTAR}}/g, ".*")     // ** matches anything including /
+      .replace(/\?/g, ".");               // ? matches single character
+    
+    const regex = new RegExp(`^${regexPattern}$`);
+    if (regex.test(filePath)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Filter file diffs based on include/exclude patterns
+ */
+export function filterFileDiffs(fileDiffs: FileDiff[], options: FilterOptions): FileDiff[] {
+  let filtered = fileDiffs;
+  
+  // Filter by include patterns (if specified)
+  if (options.includeFiles && options.includeFiles.length > 0) {
+    filtered = filtered.filter(fd => 
+      matchesPattern(fd.newPath, options.includeFiles!) ||
+      matchesPattern(fd.oldPath, options.includeFiles!)
+    );
+  }
+  
+  // Filter by exclude patterns
+  if (options.excludeFiles && options.excludeFiles.length > 0) {
+    filtered = filtered.filter(fd => 
+      !matchesPattern(fd.newPath, options.excludeFiles!) &&
+      !matchesPattern(fd.oldPath, options.excludeFiles!)
+    );
+  }
+  
+  // Filter hunks by line ranges
+  if (options.lineRanges && options.lineRanges.length > 0) {
+    filtered = filtered.map(fd => {
+      const rangesForFile = options.lineRanges!.filter(
+        r => r.file === fd.newPath || r.file === fd.oldPath
+      );
+      
+      if (rangesForFile.length === 0) {
+        // No line range filter for this file, keep all hunks
+        return fd;
+      }
+      
+      // Filter hunks to only those overlapping with specified line ranges
+      const filteredHunks = fd.hunks.filter(hunk => {
+        const hunkStart = hunk.newStart;
+        const hunkEnd = hunk.newStart + hunk.newCount - 1;
+        
+        return rangesForFile.some(range => 
+          // Hunk overlaps with range
+          hunkStart <= range.endLine && hunkEnd >= range.startLine
+        );
+      });
+      
+      return {
+        ...fd,
+        hunks: filteredHunks,
+      };
+    }).filter(fd => fd.hunks.length > 0); // Remove files with no hunks
+  }
+  
+  return filtered;
+}
+
+/**
  * Get unique file paths from a diff
  */
 export function getFilesFromDiff(diffText: string): string[] {
