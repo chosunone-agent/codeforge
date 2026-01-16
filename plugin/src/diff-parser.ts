@@ -387,3 +387,57 @@ export function extractHunkContent(hunkDiff: string): {
     },
   };
 }
+
+/**
+ * Calculate the net line offset for a file based on previously applied hunks
+ * Positive offset means the file has grown, negative means it has shrunk
+ */
+export function calculateLineOffset(
+  hunks: ParsedHunk[],
+  appliedHunkIds: Set<string>,
+  filePath: string,
+  suggestionId: string
+): number {
+  let offset = 0;
+
+  for (const hunk of hunks) {
+    const hunkId = `${suggestionId}:${filePath}:${hunks.indexOf(hunk)}`;
+    
+    if (appliedHunkIds.has(hunkId)) {
+      // This hunk was applied, calculate its net line change
+      const netChange = hunk.newCount - hunk.oldCount;
+      offset += netChange;
+    }
+  }
+
+  return offset;
+}
+
+/**
+ * Adjust a hunk's line numbers based on the current line offset
+ * This is needed when applying hunks sequentially, as previous hunks may have changed the file length
+ */
+export function adjustHunkLineNumbers(hunkDiff: string, lineOffset: number): string {
+  const lines = hunkDiff.split("\n");
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line?.startsWith("@@")) {
+      const match = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/);
+      if (match) {
+        const oldStart = parseInt(match[1]!, 10);
+        const oldCount = match[2] ? parseInt(match[2]!, 10) : 1;
+        const newStart = parseInt(match[3]!, 10);
+        const newCount = match[4] ? parseInt(match[4]!, 10) : 1;
+        const context = match[5] ?? "";
+        
+        // Adjust the new start line by the offset
+        const adjustedNewStart = newStart + lineOffset;
+        
+        lines[i] = `@@ -${oldStart}${oldCount > 1 ? `,${oldCount}` : ""} +${adjustedNewStart}${newCount > 1 ? `,${newCount}` : ""} @@${context}`;
+      }
+    }
+  }
+  
+  return lines.join("\n");
+}

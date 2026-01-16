@@ -1,6 +1,8 @@
 -- Diagnostics and code actions for CodeForge suggestions
 
 local store = require("codeforge.store")
+local diff_utils = require("codeforge.diff")
+local actions = require("codeforge.actions")
 
 local M = {}
 
@@ -17,6 +19,130 @@ local working_dir = nil
 ---@param dir string
 function M.set_working_dir(dir)
   working_dir = dir
+end
+
+---Check if a hunk is redundant (file content already matches the hunk's result)
+---@param file_path string Relative file path
+---@param hunk table Hunk object
+---@return boolean redundant
+local function is_hunk_redundant(file_path, hunk)
+  if not working_dir then
+    return false
+  end
+  
+  local full_path = working_dir .. "/" .. file_path
+  
+  -- Read current file content
+  local lines = {}
+  local file = io.open(full_path, "r")
+  if file then
+    for line in file:lines() do
+      table.insert(lines, line)
+    end
+    file:close()
+  else
+    -- File doesn't exist, hunk is not redundant
+    return false
+  end
+  
+  -- Apply the hunk to see what the result would be
+  local new_lines, err = diff_utils.apply_hunk(lines, hunk.diff)
+  if not new_lines then
+    -- Failed to apply, can't determine if redundant
+    return false
+  end
+  
+  -- Check if the result is exactly the same as the original
+  local exact_match = true
+  if #new_lines ~= #lines then
+    exact_match = false
+  else
+    for i = 1, #lines do
+      if lines[i] ~= new_lines[i] then
+        exact_match = false
+        break
+      end
+    end
+  end
+  
+  if exact_match then
+    return true
+  end
+  
+  -- Check if the hunk only adds lines that already exist in the file
+  -- This catches cases where a hunk adds duplicate lines
+  local changes = diff_utils.parse_diff_changes(hunk.diff)
+  local only_adds_existing_lines = true
+  local has_additions = false
+  
+  for _, change in ipairs(changes) do
+    if change.type == "add" then
+      has_additions = true
+      -- Check if this line already exists in the file
+      local line_exists = false
+      for _, line in ipairs(lines) do
+        if line == change.content then
+          line_exists = true
+          break
+        end
+      end
+      if not line_exists then
+        only_adds_existing_lines = false
+        break
+      end
+    elseif change.type == "remove" then
+      -- If there are any removals, it's not just adding duplicates
+      only_adds_existing_lines = false
+      break
+    end
+  end
+  
+  -- If the hunk only adds lines that already exist, it's redundant
+  if has_additions and only_adds_existing_lines then
+    return true
+  end
+  
+  return false
+end
+
+---Send feedback for a redundant hunk
+---@param suggestion_id string
+---@param hunk_id string
+local function send_redundant_feedback(suggestion_id, hunk_id)
+  -- Use a special action to indicate the hunk is redundant
+  -- We'll treat it as "accept" since the content is already correct
+  actions.send_feedback(suggestion_id, hunk_id, "accept", nil, "Hunk is redundant - file content already matches")
+end
+
+---Test helper: Check if a hunk is redundant (exposed for testing)
+---@param file_path string Relative file path
+---@param hunk table Hunk object
+---@return boolean redundant
+function M._test_is_hunk_redundant(file_path, hunk)
+  return is_hunk_redundant(file_path, hunk)
+end
+
+---Test helper: Get the diagnostic namespace (exposed for testing)
+---@return number namespace
+function M._test_get_namespace()
+  return ns
+end
+
+---Test helper: Calculate line offset (exposed for testing)
+---@param file_path string Relative file path
+---@param suggestion table Suggestion object
+---@param current_hunk_id string The hunk we're calculating offset for
+---@return number offset
+function M._test_calculate_line_offset(file_path, suggestion, current_hunk_id)
+  return calculate_line_offset(file_path, suggestion, current_hunk_id)
+end
+
+---Test helper: Adjust hunk line numbers (exposed for testing)
+---@param diff string Hunk diff
+---@param offset number Line offset
+---@return string Adjusted diff
+function M._test_adjust_hunk_line_numbers(diff, offset)
+  return adjust_hunk_line_numbers(diff, offset)
 end
 
 ---Parse the hunk header to get line numbers
@@ -75,6 +201,67 @@ function M.get_hunks_for_file(file_path)
   return hunks
 end
 
+---Calculate line offset for a file based on all previous hunks in the suggestion
+---@param file_path string Relative file path
+---@param suggestion table Suggestion object
+---@param current_hunk_id string The hunk we're calculating offset for
+---@return number offset
+local function calculate_line_offset(file_path, suggestion, current_hunk_id)
+  local offset = 0
+  local found_current = false
+  
+  for _, hunk in ipairs(suggestion.hunks) do
+    if hunk.file == file_path then
+      if hunk.id == current_hunk_id then
+        found_current = true
+        break
+      end
+      
+      -- Only count hunks that come before the current hunk
+      if not found_current then
+        -- Parse the hunk to get line counts
+        local header = diff_utils.parse_hunk_header(hunk.diff)
+        if header then
+          offset = offset + (header.new_count - header.old_count)
+        end
+      end
+    end
+  end
+  
+  return offset
+end
+
+---Adjust hunk line numbers based on offset
+---@param diff string Hunk diff
+---@param offset number Line offset
+---@return string Adjusted diff
+local function adjust_hunk_line_numbers(diff, offset)
+  if offset == 0 then
+    return diff
+  end
+  
+  local lines = vim.split(diff, "\n")
+  for i, line in ipairs(lines) do
+    if line:match("^@@") then
+      local old_start, old_count, new_start, new_count = line:match("^@@ %-(%d+),?(%d*) %+(%d+),?(%d*) @@")
+      if old_start then
+        old_start = tonumber(old_start)
+        old_count = tonumber(old_count) or 1
+        new_start = tonumber(new_start)
+        new_count = tonumber(new_count) or 1
+        
+        local adjusted_new_start = new_start + offset
+        local old_count_str = old_count > 1 and "," .. old_count or ""
+        local new_count_str = new_count > 1 and "," .. new_count or ""
+        
+        lines[i] = string.format("@@ -%d%s +%d%s @@", old_start, old_count_str, adjusted_new_start, new_count_str)
+      end
+    end
+  end
+  
+  return table.concat(lines, "\n")
+end
+
 ---Publish diagnostics for a buffer
 ---@param bufnr number
 function M.publish_diagnostics(bufnr)
@@ -94,23 +281,46 @@ function M.publish_diagnostics(bufnr)
   local diagnostics = {}
   
   for _, item in ipairs(hunks) do
-    local start_line, line_count = parse_hunk_lines(item.hunk.diff)
-    if start_line then
-      table.insert(diagnostics, {
-        lnum = start_line - 1, -- 0-indexed
-        end_lnum = start_line - 1 + (line_count or 1) - 1,
-        col = 0,
-        end_col = 0,
-        severity = vim.diagnostic.severity.HINT,
-        source = "codeforge",
-        message = "AI suggestion available",
-        code = item.hunk.id,
-        data = {
-          hunk_id = item.hunk.id,
-          suggestion_id = item.suggestion.id,
-          file = item.hunk.file,
-        },
-      })
+    -- Calculate line offset for this hunk (based on all previous hunks in the suggestion)
+    local offset = calculate_line_offset(rel_path, item.suggestion, item.hunk.id)
+    
+    -- Adjust hunk diff if there's an offset
+    local adjusted_diff = item.hunk.diff
+    if offset ~= 0 then
+      adjusted_diff = adjust_hunk_line_numbers(item.hunk.diff, offset)
+    end
+    
+    -- Check if hunk is redundant
+    local redundant = is_hunk_redundant(rel_path, {
+      id = item.hunk.id,
+      file = item.hunk.file,
+      diff = adjusted_diff,
+    })
+    
+    if redundant then
+      -- Automatically send feedback for redundant hunks
+      send_redundant_feedback(item.suggestion.id, item.hunk.id)
+      -- Mark as reviewed so it doesn't show up again
+      store.set_hunk_state(item.hunk.id, "accepted")
+    else
+      local start_line, line_count = parse_hunk_lines(adjusted_diff)
+      if start_line then
+        table.insert(diagnostics, {
+          lnum = start_line - 1, -- 0-indexed
+          end_lnum = start_line - 1 + (line_count or 1) - 1,
+          col = 0,
+          end_col = 0,
+          severity = vim.diagnostic.severity.HINT,
+          source = "codeforge",
+          message = item.hunk.description or "AI suggestion available",
+          code = item.hunk.id,
+          data = {
+            hunk_id = item.hunk.id,
+            suggestion_id = item.suggestion.id,
+            file = item.hunk.file,
+          },
+        })
+      end
     end
   end
   

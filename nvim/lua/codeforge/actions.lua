@@ -30,7 +30,7 @@ end
 ---@param modified_diff? string
 ---@param comment? string
 ---@return boolean
-local function send_feedback(suggestion_id, hunk_id, action, modified_diff, comment)
+function M.send_feedback(suggestion_id, hunk_id, action, modified_diff, comment)
   if not ws_client or not ws_client:is_active() then
     vim.notify("[codeforge] Not connected to server", vim.log.levels.ERROR)
     return false

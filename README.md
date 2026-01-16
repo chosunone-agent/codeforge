@@ -168,6 +168,13 @@ Emitted when AI has prepared changes for review.
     hunks: Hunk[]
   }
 }
+
+interface Hunk {
+  id: string,
+  file: string,
+  diff: string,
+  description?: string  // Short one-line description shown in editor UI
+}
 ```
 
 #### suggestion.hunk_applied

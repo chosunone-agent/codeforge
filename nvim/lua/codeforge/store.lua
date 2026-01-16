@@ -170,6 +170,20 @@ function M.get_suggestion(suggestion_id)
   return state.suggestions[suggestion_id]
 end
 
+---Get a suggestion by hunk ID
+---@param hunk_id string
+---@return Suggestion|nil
+function M.get_suggestion_by_hunk_id(hunk_id)
+  for _, suggestion in pairs(state.suggestions) do
+    for _, hunk in ipairs(suggestion.hunks) do
+      if hunk.id == hunk_id then
+        return suggestion
+      end
+    end
+  end
+  return nil
+end
+
 ---Get current suggestion
 ---@return Suggestion|nil
 function M.get_current_suggestion()

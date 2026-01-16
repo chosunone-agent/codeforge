@@ -21,6 +21,8 @@ export interface Hunk {
   originalLines?: string[];
   /** Start line number in the original file (1-indexed) */
   originalStartLine?: number;
+  /** Short one-line description of what this hunk changes */
+  description?: string;
 }
 
 /**

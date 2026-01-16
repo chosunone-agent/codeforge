@@ -17,7 +17,7 @@ import { join } from "path";
 // Server type from Bun.serve()
 import { SuggestionStore, generateSuggestionId } from "./suggestion-store.ts";
 import { SuggestionEventEmitter } from "./event-emitter.ts";
-import { parseDiff, fileDiffsToHunks, filterFileDiffs, type FilterOptions } from "./diff-parser.ts";
+import { parseDiff, fileDiffsToHunks, filterFileDiffs, type FilterOptions, calculateLineOffset, adjustHunkLineNumbers } from "./diff-parser.ts";
 import { applyHunkToFile, applyModifiedHunk, reverseHunk } from "./patch-applier.ts";
 import { createHttpServer } from "./http-server.ts";
 import type { HunkFeedback, PublishSuggestionResult, FeedbackResult } from "./types.ts";
@@ -141,6 +141,9 @@ export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
     console.warn(`[codeforge] Invalid working directory "${directory}", using fallback: ${workingDir}`);
   }
 
+  // Set the shell working directory to the project directory
+  const shell = $.cwd(workingDir);
+
   // Load configuration from files and environment
   const config = loadConfig(workingDir);
   
@@ -224,6 +227,7 @@ export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
               end_line: tool.schema.number().describe("End line number (inclusive)"),
             })
           ).optional().describe("Filter hunks to only include those overlapping with specified line ranges"),
+          hunk_descriptions: tool.schema.record(tool.schema.string(), tool.schema.string()).optional().describe("Map of hunk IDs to short one-line descriptions. If provided, these will be shown in the editor instead of hunk IDs. Format: {\"suggestion-id:file:0\": \"Add error handling\", \"suggestion-id:file:1\": \"Fix typo\"}"),
         },
         async execute(args): Promise<string> {
           try {
@@ -236,10 +240,10 @@ export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
             }
 
             // Get the change ID
-            const changeId = args.change_id ?? await getCurrentChangeId($);
+            const changeId = args.change_id ?? await getCurrentChangeId(shell);
 
             // Get the diff
-            const diffText = await getJjDiff($, changeId);
+            const diffText = await getJjDiff(shell, changeId);
 
             if (!diffText.trim()) {
               return JSON.stringify({
@@ -251,24 +255,27 @@ export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
             // Parse the diff into file diffs
             let fileDiffs = parseDiff(diffText);
             
-            // Apply filters if specified
-            const hasFilters = args.files || args.exclude_files || args.line_ranges;
-            if (hasFilters) {
-              const filterOptions: FilterOptions = {
-                includeFiles: args.files,
-                excludeFiles: args.exclude_files,
-                lineRanges: args.line_ranges?.map(r => ({
-                  file: r.file,
-                  startLine: r.start_line,
-                  endLine: r.end_line,
-                })),
-              };
-              fileDiffs = filterFileDiffs(fileDiffs, filterOptions);
-            }
+            // Always exclude .opencode directory files
+            const defaultExcludeFiles = [".opencode/**"];
+            const excludeFiles = args.exclude_files 
+              ? [...defaultExcludeFiles, ...args.exclude_files]
+              : defaultExcludeFiles;
+            
+            // Apply filters (always apply default exclude)
+            const filterOptions: FilterOptions = {
+              includeFiles: args.files,
+              excludeFiles,
+              lineRanges: args.line_ranges?.map(r => ({
+                file: r.file,
+                startLine: r.start_line,
+                endLine: r.end_line,
+              })),
+            };
+            fileDiffs = filterFileDiffs(fileDiffs, filterOptions);
             
             // Convert to hunks
             const suggestionId = generateSuggestionId();
-            const hunks = fileDiffsToHunks(fileDiffs, suggestionId);
+            let hunks = fileDiffsToHunks(fileDiffs, suggestionId);
             const files = [...new Set(fileDiffs.map(fd => fd.newPath !== "/dev/null" ? fd.newPath : fd.oldPath))];
 
             if (hunks.length === 0) {
@@ -277,6 +284,14 @@ export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
                 success: false,
                 error: `No hunks found in diff${filterMsg}`,
               });
+            }
+
+            // Apply custom hunk descriptions if provided
+            if (args.hunk_descriptions) {
+              hunks = hunks.map(hunk => ({
+                ...hunk,
+                description: args.hunk_descriptions![hunk.id] || hunk.description,
+              }));
             }
 
             // Create the suggestion with relative working directory (relative to home)
@@ -372,13 +387,36 @@ export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
 
             const filePath = `${workingDir}/${hunk.file}`;
 
+            // Calculate line offset based on previously applied hunks in this file
+            const fileHunks = suggestion.hunks.filter(h => h.file === hunk.file);
+            const appliedHunkIds = new Set<string>();
+            for (const [hunkId, state] of suggestion.hunkStates) {
+              if (state.reviewed && state.applied) {
+                appliedHunkIds.add(hunkId);
+              }
+            }
+            
+            // Parse all hunks to get their metadata
+            const fileDiffs = parseDiff(`diff --git a/${hunk.file} b/${hunk.file}\n` + 
+              fileHunks.map(h => h.diff).join("\n"));
+            const parsedHunks = fileDiffs[0]?.hunks || [];
+            
+            // Calculate the line offset for this hunk
+            const lineOffset = calculateLineOffset(parsedHunks, appliedHunkIds, hunk.file, args.suggestion_id);
+            
+            // Adjust the hunk diff if there's an offset
+            let adjustedDiff = hunk.diff;
+            if (lineOffset !== 0) {
+              adjustedDiff = adjustHunkLineNumbers(hunk.diff, lineOffset);
+            }
+
             if (args.action === "accept") {
               // Accept: hunk is already in working copy, nothing to do
               // (AI made the change, user approved it)
               applied = true;
             } else if (args.action === "modify") {
               // Modify: revert original, apply modified version
-              const revertResult = await applyHunkToFile(filePath, reverseHunk(hunk.diff));
+              const revertResult = await applyHunkToFile(filePath, reverseHunk(adjustedDiff));
               if (!revertResult.success) {
                 await emitter.emitError(
                   "apply_failed",
@@ -411,7 +449,7 @@ export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
               applied = true;
             } else if (args.action === "reject") {
               // Reject: revert the hunk (undo the AI's change)
-              const revertResult = await applyHunkToFile(filePath, reverseHunk(hunk.diff));
+              const revertResult = await applyHunkToFile(filePath, reverseHunk(adjustedDiff));
               if (!revertResult.success) {
                 await emitter.emitError(
                   "apply_failed",
@@ -552,7 +590,7 @@ export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
             if (args.action === "finalize") {
               // Sync with shared repo
               try {
-                await $`jj git push`.text();
+                await shell`jj git push`.text();
                 await emitter.emitStatus("applied", "Changes synced to remote", args.suggestion_id);
               } catch (error) {
                 await emitter.emitError(
@@ -626,6 +664,48 @@ export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
               hunkStates[key] = value;
             }
 
+            // Adjust hunk line numbers based on previously applied hunks
+            const adjustedHunks = [...suggestion.hunks];
+            const appliedHunkIds = new Set<string>();
+            for (const [hunkId, state] of suggestion.hunkStates) {
+              if (state.reviewed && state.applied) {
+                appliedHunkIds.add(hunkId);
+              }
+            }
+
+            // Group hunks by file and adjust line numbers
+            const files = new Set(suggestion.hunks.map(h => h.file));
+            for (const file of files) {
+              const fileHunks = suggestion.hunks.filter(h => h.file === file);
+              
+              // Parse all hunks to get their metadata
+              const fileDiffs = parseDiff(`diff --git a/${file} b/${file}\n` + 
+                fileHunks.map(h => h.diff).join("\n"));
+              const parsedHunks = fileDiffs[0]?.hunks || [];
+              
+              // Adjust each hunk's line numbers
+              for (let i = 0; i < fileHunks.length; i++) {
+                const hunk = fileHunks[i]!;
+                const hunkId = hunk.id;
+                
+                // Calculate line offset for this hunk
+                const lineOffset = calculateLineOffset(parsedHunks, appliedHunkIds, file, args.suggestion_id);
+                
+                // Adjust the hunk diff if there's an offset
+                if (lineOffset !== 0) {
+                  const adjustedDiff = adjustHunkLineNumbers(hunk.diff, lineOffset);
+                  // Update the hunk in the adjustedHunks array
+                  const adjustedIndex = adjustedHunks.findIndex(h => h.id === hunkId);
+                  if (adjustedIndex !== -1) {
+                    adjustedHunks[adjustedIndex] = {
+                      ...adjustedHunks[adjustedIndex]!,
+                      diff: adjustedDiff,
+                    };
+                  }
+                }
+              }
+            }
+
             return JSON.stringify({
               success: true,
               suggestion: {
@@ -633,7 +713,7 @@ export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
                 jjChangeId: suggestion.jjChangeId,
                 description: suggestion.description,
                 files: suggestion.files,
-                hunks: suggestion.hunks,
+                hunks: adjustedHunks,
                 status: suggestion.status,
                 createdAt: suggestion.createdAt,
                 hunkStates,

@@ -5,6 +5,8 @@ import {
   getFilesFromDiff,
   extractHunkContent,
   filterFileDiffs,
+  calculateLineOffset,
+  adjustHunkLineNumbers,
   type FileDiff,
   type FilterOptions,
 } from "../src/diff-parser.ts";
@@ -579,5 +581,130 @@ describe("filterFileDiffs", () => {
 
     expect(result).toHaveLength(1);
     expect(result[0]!.newPath).toBe("src/a.ts");
+  });
+});
+
+describe("calculateLineOffset", () => {
+  test("calculates offset from applied hunks", () => {
+    const hunks = [
+      { oldStart: 10, oldCount: 5, newStart: 10, newCount: 7, content: "@@ -10,5 +10,7 @@" },
+      { oldStart: 20, oldCount: 3, newStart: 22, newCount: 4, content: "@@ -20,3 +22,4 @@" },
+      { oldStart: 30, oldCount: 2, newStart: 33, newCount: 2, content: "@@ -30,2 +33,2 @@" },
+    ];
+
+    const appliedHunkIds = new Set(["suggestion-123:file.ts:0"]);
+    const offset = calculateLineOffset(hunks, appliedHunkIds, "file.ts", "suggestion-123");
+
+    // First hunk adds 2 lines (7 - 5)
+    expect(offset).toBe(2);
+  });
+
+  test("calculates offset from multiple applied hunks", () => {
+    const hunks = [
+      { oldStart: 10, oldCount: 5, newStart: 10, newCount: 7, content: "@@ -10,5 +10,7 @@" },
+      { oldStart: 20, oldCount: 3, newStart: 22, newCount: 4, content: "@@ -20,3 +22,4 @@" },
+      { oldStart: 30, oldCount: 2, newStart: 33, newCount: 2, content: "@@ -30,2 +33,2 @@" },
+    ];
+
+    const appliedHunkIds = new Set(["suggestion-123:file.ts:0", "suggestion-123:file.ts:1"]);
+    const offset = calculateLineOffset(hunks, appliedHunkIds, "file.ts", "suggestion-123");
+
+    // First hunk adds 2 lines, second hunk adds 1 line
+    expect(offset).toBe(3);
+  });
+
+  test("returns zero when no hunks applied", () => {
+    const hunks = [
+      { oldStart: 10, oldCount: 5, newStart: 10, newCount: 7, content: "@@ -10,5 +10,7 @@" },
+    ];
+
+    const appliedHunkIds = new Set<string>();
+    const offset = calculateLineOffset(hunks, appliedHunkIds, "file.ts", "suggestion-123");
+
+    expect(offset).toBe(0);
+  });
+
+  test("handles negative offset (removing lines)", () => {
+    const hunks = [
+      { oldStart: 10, oldCount: 7, newStart: 10, newCount: 5, content: "@@ -10,7 +10,5 @@" },
+    ];
+
+    const appliedHunkIds = new Set(["suggestion-123:file.ts:0"]);
+    const offset = calculateLineOffset(hunks, appliedHunkIds, "file.ts", "suggestion-123");
+
+    // Hunk removes 2 lines (5 - 7)
+    expect(offset).toBe(-2);
+  });
+});
+
+describe("adjustHunkLineNumbers", () => {
+  test("adjusts hunk with positive offset", () => {
+    const hunkDiff = `@@ -10,5 +10,7 @@ function example()
+ line1
+ line2
+-line3
++line3a
++line3b
+ line4
+ line5`;
+
+    const adjusted = adjustHunkLineNumbers(hunkDiff, 3);
+
+    expect(adjusted).toContain("@@ -10,5 +13,7 @@");
+  });
+
+  test("adjusts hunk with negative offset", () => {
+    const hunkDiff = `@@ -10,5 +10,7 @@ function example()
+ line1
+ line2
+-line3
++line3a
++line3b
+ line4
+ line5`;
+
+    const adjusted = adjustHunkLineNumbers(hunkDiff, -2);
+
+    expect(adjusted).toContain("@@ -10,5 +8,7 @@");
+  });
+
+  test("leaves hunk unchanged with zero offset", () => {
+    const hunkDiff = `@@ -10,5 +10,7 @@ function example()
+ line1
+ line2
+-line3
++line3a
++line3b
+ line4
+ line5`;
+
+    const adjusted = adjustHunkLineNumbers(hunkDiff, 0);
+
+    expect(adjusted).toBe(hunkDiff);
+  });
+
+  test("preserves context in hunk header", () => {
+    const hunkDiff = `@@ -10,5 +10,7 @@ function example() {
+ line1
+ line2
+-line3
++line3a
++line3b
+ line4
+ line5}`;
+
+    const adjusted = adjustHunkLineNumbers(hunkDiff, 5);
+
+    expect(adjusted).toContain("@@ -10,5 +15,7 @@ function example() {");
+  });
+
+  test("handles hunk with single line counts", () => {
+    const hunkDiff = `@@ -10 +10 @@
+-line
++new line`;
+
+    const adjusted = adjustHunkLineNumbers(hunkDiff, 3);
+
+    expect(adjusted).toContain("@@ -10 +13 @@");
   });
 });

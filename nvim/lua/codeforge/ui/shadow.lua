@@ -42,6 +42,37 @@ function M.set_working_dir(dir)
   working_dir = dir
 end
 
+---Adjust hunk line numbers based on offset
+---@param diff string Hunk diff
+---@param offset number Line offset
+---@return string Adjusted diff
+local function adjust_hunk_line_numbers(diff, offset)
+  if offset == 0 then
+    return diff
+  end
+  
+  local lines = vim.split(diff, "\n")
+  for i, line in ipairs(lines) do
+    if line:match("^@@") then
+      local old_start, old_count, new_start, new_count = line:match("^@@ %-(%d+),?(%d*) %+(%d+),?(%d*) @@")
+      if old_start then
+        old_start = tonumber(old_start)
+        old_count = tonumber(old_count) or 1
+        new_start = tonumber(new_start)
+        new_count = tonumber(new_count) or 1
+        
+        local adjusted_new_start = new_start + offset
+        local old_count_str = old_count > 1 and "," .. old_count or ""
+        local new_count_str = new_count > 1 and "," .. new_count or ""
+        
+        lines[i] = string.format("@@ -%d%s +%d%s @@", old_start, old_count_str, adjusted_new_start, new_count_str)
+      end
+    end
+  end
+  
+  return table.concat(lines, "\n")
+end
+
 ---Handle save command on shadow buffer
 ---If buffer was modified, computes diff and triggers modify action
 ---If buffer was NOT modified, triggers accept action (user accepts AI's change as-is)
@@ -488,19 +519,25 @@ local function highlight_diff(buf, hunk_diff, start_line, end_line)
   if end_line > buf_line_count then end_line = buf_line_count end
   if start_line > end_line then return end  -- Invalid range, skip highlighting
 
+  -- Parse the diff changes to find which lines are added
   local changes = diff_utils.parse_diff_changes(hunk_diff)
-  local line = start_line - 1 -- 0-indexed
-
+  
+  -- Walk through the changes and highlight added lines
+  -- The key insight: we need to track our position in the buffer as we walk through the diff
+  local buffer_line = start_line - 1  -- 0-indexed
+  
   for _, change in ipairs(changes) do
-    if line >= buf_line_count then break end  -- Don't go past buffer end
+    if buffer_line >= buf_line_count then break end  -- Don't go past buffer end
+    
     if change.type == "add" then
-      -- Highlight added lines
-      vim.api.nvim_buf_add_highlight(buf, ns, "DiffAdd", line, 0, -1)
-      line = line + 1
+      -- Highlight the added line
+      vim.api.nvim_buf_add_highlight(buf, ns, "DiffAdd", buffer_line, 0, -1)
+      buffer_line = buffer_line + 1
     elseif change.type == "context" then
-      line = line + 1
+      -- Context line - don't highlight, but move to next line
+      buffer_line = buffer_line + 1
     end
-    -- "remove" lines don't exist in the shadow buffer
+    -- "remove" lines don't exist in the shadow buffer, so they don't consume a buffer line
   end
   
   -- Place extmarks at the boundaries - these will move with the text!
@@ -591,22 +628,54 @@ function M.open(hunk, working_dir)
   original_content = vim.deepcopy(local_content)
   
   local showing_diff_only = false
-  local header = diff_utils.parse_hunk_header(hunk.diff:match("^[^\n]+"))
+  
+  -- Calculate line offset from previous hunks in the same suggestion
+  local suggestion = store.get_suggestion_by_hunk_id and store.get_suggestion_by_hunk_id(hunk.id)
+  local adjusted_diff = hunk.diff
+  local offset = 0
+  if suggestion then
+    local found_current = false
+    
+    for _, prev_hunk in ipairs(suggestion.hunks) do
+      if prev_hunk.file == hunk.file then
+        if prev_hunk.id == hunk.id then
+          found_current = true
+          break
+        end
+        
+        -- Only count hunks that come before the current hunk
+        if not found_current then
+          local header = diff_utils.parse_hunk_header(prev_hunk.diff:match("^[^\n]+"))
+          if header then
+            offset = offset + (header.new_count - header.old_count)
+          end
+        end
+      end
+    end
+    
+    -- Adjust hunk line numbers if there's an offset
+    if offset ~= 0 then
+      adjusted_diff = adjust_hunk_line_numbers(hunk.diff, offset)
+    end
+  end
+  
+  -- Parse header from adjusted diff (not original)
+  local header = diff_utils.parse_hunk_header(adjusted_diff:match("^[^\n]+"))
   
   if not file_exists or #local_content == 0 then
     -- File doesn't exist locally - this is a new file, extract content from diff
-    preview_content = extract_new_content_from_diff(hunk.diff)
+    preview_content = extract_new_content_from_diff(adjusted_diff)
     showing_diff_only = true
   else
     -- File exists - apply the hunk to show the preview
-    local applied, err = diff_utils.apply_hunk(local_content, hunk.diff)
+    local applied, err = diff_utils.apply_hunk(local_content, adjusted_diff)
     if applied then
       preview_content = applied
     else
       -- If hunk doesn't apply cleanly, fall back to showing just the diff content
       -- This can happen if the file has diverged from the expected state
       vim.notify("CodeForge: Hunk may not apply cleanly: " .. (err or "unknown error"), vim.log.levels.WARN)
-      preview_content = extract_new_content_from_diff(hunk.diff)
+      preview_content = extract_new_content_from_diff(adjusted_diff)
       showing_diff_only = true
     end
   end
@@ -698,10 +767,13 @@ function M.open(hunk, working_dir)
     local highlight_end
     
     if not showing_diff_only then
-      -- Showing full file with hunk applied - use new_start from header
-      target_line = header.new_start
-      highlight_start = header.new_start
-      highlight_end = header.new_start + header.new_count - 1
+      -- Showing full file with hunk applied - calculate actual buffer position
+      -- The hunk is applied at header.old_start in the original file,
+      -- which becomes header.old_start + offset in the buffer after previous hunks
+      local actual_buffer_start = header.old_start + offset
+      target_line = actual_buffer_start
+      highlight_start = actual_buffer_start
+      highlight_end = actual_buffer_start + header.new_count - 1
     else
       -- Showing extracted diff content only - start from line 1
       target_line = 1
@@ -749,7 +821,7 @@ function M.open(hunk, working_dir)
     vim.api.nvim_win_set_cursor(shadow_win, { target_line, 0 })
 
     -- Highlight the changed lines and mark editable region in gutter
-    highlight_diff(shadow_buf, hunk.diff, highlight_start, highlight_end)
+    highlight_diff(shadow_buf, adjusted_diff, highlight_start, highlight_end)
   end
 
   return shadow_buf, shadow_win

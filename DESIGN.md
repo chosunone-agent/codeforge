@@ -140,8 +140,10 @@ interface Hunk {
   id: string                      // unique hunk ID within suggestion (e.g., "suggestion-id:file:hunk-index")
   file: string                    // relative file path
   diff: string                    // unified diff format for this hunk
-                                  // includes @@ line numbers, context, and +/- lines
-                                  // neovim parses this for display (inline, side-by-side, etc.)
+                                   // includes @@ line numbers, context, and +/- lines
+                                   // neovim parses this for display (inline, side-by-side, etc.)
+  description?: string            // short one-line description of what this hunk changes
+                                   // shown in editor UI instead of hunk ID
 }
 ```
 
@@ -520,13 +522,23 @@ tool({
   args: {
     description: z.string().describe("Human-readable description of the changes"),
     change_id: z.string().optional().describe("jj change ID, defaults to current"),
+    files: z.array(z.string()).optional().describe("File paths or glob patterns to include"),
+    exclude_files: z.array(z.string()).optional().describe("File paths or glob patterns to exclude"),
+    line_ranges: z.array(z.object({
+      file: z.string(),
+      start_line: z.number(),
+      end_line: z.number(),
+    })).optional().describe("Filter hunks by line ranges"),
+    hunk_descriptions: z.record(z.string(), z.string()).optional().describe("Map of hunk IDs to short one-line descriptions"),
   },
   async execute(args, ctx) {
     // 1. Get diff from jj: `jj diff -r <change_id>`
     // 2. Parse into hunks (split by file and @@ markers)
-    // 3. Generate suggestion ID
-    // 4. Store in pending suggestions
-    // 5. Emit suggestion.ready event
+    // 3. Apply filters if specified (files, exclude_files, line_ranges)
+    // 4. Apply custom hunk descriptions if provided
+    // 5. Generate suggestion ID
+    // 6. Store in pending suggestions
+    // 7. Emit suggestion.ready event
     // Returns: { suggestion_id, hunk_count, files }
   }
 })

@@ -21,3 +21,6 @@ coverage/
 # Local env
 .env
 .env.local
+
+# OpenCode
+.opencode/
