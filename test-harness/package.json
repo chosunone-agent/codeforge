@@ -1,0 +1,15 @@
+{
+  "name": "suggestion-test-harness",
+  "description": "Test harness that simulates neovim talking to OpenCode",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun run index.ts",
+    "test:direct": "bun run direct-test.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  }
+}
