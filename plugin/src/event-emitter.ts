@@ -1,16 +1,15 @@
 /**
  * Event emission for suggestion events
  * 
- * Since OpenCode plugins don't have a direct way to emit custom SSE events,
- * we use the app.log() API with a convention that the neovim side can watch for.
+ * Events are emitted via:
+ * 1. OpenCode's app.log() API (for SSE filtering by neovim)
+ * 2. WebSocket broadcast (for real-time bidirectional communication)
  * 
  * Events are logged with:
- * - service: "suggestion-manager"
+ * - service: "codeforge"
  * - level: "info" 
  * - message: JSON stringified event
  * - extra: { event: true, eventType: "<type>" }
- * 
- * The neovim plugin can filter the SSE stream for these log entries.
  */
 
 import type { createOpencodeClient } from "@opencode-ai/sdk";
@@ -23,10 +22,11 @@ import type {
   SuggestionListEvent,
   Suggestion,
 } from "./types.ts";
+import { broadcast } from "./http-server.ts";
 
 export type OpencodeClient = ReturnType<typeof createOpencodeClient>;
 
-const SERVICE_NAME = "suggestion-manager";
+const SERVICE_NAME = "codeforge";
 
 // Store for AI notifications (feedback received)
 interface AINotification {
@@ -86,8 +86,13 @@ export class SuggestionEventEmitter {
 
   /**
    * Emit a suggestion event
+   * @param workingDirectory If specified, only broadcast to clients subscribed to this directory
    */
-  async emit(event: SuggestionEvent): Promise<void> {
+  async emit(event: SuggestionEvent, workingDirectory?: string): Promise<void> {
+    // Broadcast to WebSocket clients (filtered by working directory if specified)
+    broadcast(event, workingDirectory);
+    
+    // Also log via OpenCode's API (for SSE fallback)
     try {
       await this.client.app.log({
         body: {
@@ -100,9 +105,8 @@ export class SuggestionEventEmitter {
           },
         },
       });
-    } catch (error) {
-      console.error("Failed to emit event:", error);
-      throw error;
+    } catch {
+      // Silently fail - WebSocket broadcast is primary
     }
   }
 
@@ -118,9 +122,11 @@ export class SuggestionEventEmitter {
         description: suggestion.description,
         files: suggestion.files,
         hunks: suggestion.hunks,
+        workingDirectory: suggestion.workingDirectory,
       },
     };
-    await this.emit(event);
+    // Only broadcast to clients subscribed to this suggestion's working directory
+    await this.emit(event, suggestion.workingDirectory);
   }
 
   /**
@@ -223,8 +229,8 @@ export function parseLogEvent(logMessage: string, extra?: Record<string, unknown
 }
 
 /**
- * Check if a log entry is from the suggestion-manager service
+ * Check if a log entry is from the codeforge service
  */
-export function isSuggestionManagerLog(service: string): boolean {
+export function isCodeForgeLog(service: string): boolean {
   return service === SERVICE_NAME;
 }

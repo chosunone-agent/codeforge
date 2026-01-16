@@ -30,25 +30,27 @@ When working with an AI coding assistant, the current workflow has limitations:
 │                            USER'S NEOVIM                                    │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
 │  │  opencode.nvim + suggestion-review extension                        │    │
-│  │  - Connects to sandbox opencode server via API                      │    │
-│  │  - Subscribes to SSE events for notifications                       │    │
+│  │  - Connects via WebSocket for real-time bidirectional communication │    │
+│  │  - Receives push events (suggestion.ready, hunk_applied, etc.)      │    │
+│  │  - Sends commands (feedback, list, get, complete)                   │    │
 │  │  - Shows notification when suggestions ready                        │    │
 │  │  - Provides hunk-by-hunk review UI                                  │    │
-│  │  - Sends feedback back to sandbox                                   │    │
 │  └─────────────────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
-                                    │ HTTP/SSE (localhost:PORT, configurable)
+                                    │ WebSocket + HTTP (localhost:4097)
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         SANDBOX (opencode user)                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  opencode serve --port PORT                                         │    │
-│  │  + suggestion-manager plugin                                        │    │
-│  │    - Provides `publish_suggestion` tool for AI to call              │    │
-│  │    - Emits custom SSE events when suggestions ready                 │    │
+│  │  opencode serve                                                     │    │
+│  │  + suggestion-manager plugin (HTTP + WebSocket server on :4097)     │    │
+│  │    - Provides tools for AI (publish_suggestion, etc.)               │    │
+│  │    - WebSocket endpoint (/ws) for real-time client connections      │    │
+│  │    - Broadcasts events to all connected clients                     │    │
+│  │    - HTTP endpoints for simple testing/debugging                    │    │
 │  │    - Receives and logs feedback from user reviews                   │    │
-│  │    - Handles repo sync after changes applied                        │    │
+│  │    - Notifies AI via session prompt injection                       │    │
 │  └─────────────────────────────────────────────────────────────────────┘    │
 │                                                                             │
 │  Version Control (jj):                                                      │
@@ -92,17 +94,31 @@ Both the user and sandbox have clones of the same repository. Sync happens via:
 
 ## Protocol Specification
 
+### Communication
+
+The plugin exposes two communication methods:
+
+1. **WebSocket** (primary) - `ws://localhost:4097/ws`
+   - Persistent bidirectional connection
+   - Server pushes events in real-time
+   - Client sends commands and receives responses
+   
+2. **HTTP REST** (fallback/testing) - `http://localhost:4097`
+   - Simple request/response
+   - Good for testing with curl
+
 ### Design Decisions
 
 Based on requirements discussion:
 
 1. **Hunk format**: Unified diff format - parsed on neovim side for display
-2. **Feedback endpoint**: OpenCode plugin tool - feedback sent to plugin which applies actions
-3. **Real-time status**: Yes - periodic one-line updates before final ready
+2. **Feedback endpoint**: WebSocket or HTTP - both supported
+3. **Real-time status**: Yes - events pushed via WebSocket immediately
 4. **Multiple suggestions**: Supported - each has unique ID, can apply feedback independently
 5. **Partial apply**: Hunk-level granularity - each hunk applied/rejected independently
+6. **AI notification**: Feedback is injected into AI's session via prompt injection
 
-### Event Types (Sandbox → User Editor via SSE)
+### Event Types (Server → Client via WebSocket)
 
 #### suggestion.ready
 
@@ -183,9 +199,71 @@ interface SuggestionHunkApplied {
 }
 ```
 
-### Feedback Types (User Editor → Sandbox via OpenCode Plugin Tool)
+### Client Commands (Client → Server via WebSocket)
 
-Feedback is sent by calling the `suggestion_feedback` tool exposed by the suggestion-manager plugin.
+Commands are sent as JSON messages. Each command can include an optional `id` field for request/response correlation.
+
+#### feedback
+
+```typescript
+{
+  type: "feedback"
+  id?: string                       // optional, for response correlation
+  suggestionId: string
+  hunkId: string
+  action: "accept" | "reject" | "modify"
+  modifiedDiff?: string             // required if action is "modify"
+  comment?: string
+}
+```
+
+#### complete
+
+```typescript
+{
+  type: "complete"
+  id?: string
+  suggestionId: string
+  action: "finalize" | "discard"
+}
+```
+
+#### list
+
+```typescript
+{
+  type: "list"
+  id?: string
+}
+```
+
+#### get
+
+```typescript
+{
+  type: "get"
+  id?: string
+  suggestionId: string
+}
+```
+
+### Response Messages (Server → Client)
+
+Responses to commands include the original `id` if provided:
+
+```typescript
+{
+  type: "response"
+  id?: string                       // echoed from request
+  success: boolean
+  data?: object                     // command-specific data
+  error?: string                    // if success is false
+}
+```
+
+### Feedback Types (Alternative: HTTP REST API)
+
+Feedback can also be sent via HTTP POST for simpler integrations:
 
 #### HunkFeedback
 
@@ -362,7 +440,7 @@ require("opencode").setup({
   suggestion_review = {
     server = {
       host = "localhost",
-      port = 4096,
+      port = 4097,           -- WebSocket + HTTP server port
     },
     ui = {
       style = "floating",  -- "floating" | "telescope" | "inline"
@@ -387,6 +465,17 @@ require("opencode").setup({
   },
 })
 ```
+
+### HTTP Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Health check, returns `{healthy: true, service: "suggestion-manager", wsClients: N}` |
+| GET | `/suggestions` | List all pending suggestions |
+| GET | `/suggestions/:id` | Get suggestion details including hunks |
+| POST | `/feedback` | Submit hunk feedback (JSON body: HunkFeedback) |
+| POST | `/complete` | Complete suggestion (JSON body: SuggestionComplete) |
+| GET | `/ws` | WebSocket upgrade endpoint |
 
 ## Design Decisions (Resolved)
 
@@ -535,8 +624,10 @@ tool({
 │   │   ├── types.ts              # TypeScript type definitions
 │   │   ├── diff-parser.ts        # Unified diff parser
 │   │   ├── suggestion-store.ts   # Suggestion state management
-│   │   ├── event-emitter.ts      # SSE event emission
-│   │   └── patch-applier.ts      # Apply hunks to files
+│   │   ├── event-emitter.ts      # Event emission (WebSocket + SSE)
+│   │   ├── patch-applier.ts      # Apply hunks to files
+│   │   ├── http-server.ts        # HTTP + WebSocket server
+│   │   └── loader.ts             # Plugin loader for symlink setup
 │   ├── tests/                    # Test suite
 │   │   ├── diff-parser.test.ts
 │   │   ├── suggestion-store.test.ts
@@ -544,18 +635,24 @@ tool({
 │   │   └── patch-applier.test.ts
 │   ├── package.json
 │   └── tsconfig.json
+├── test-harness/                 # Test utilities
+│   ├── ws-test.ts                # WebSocket test client
+│   ├── http-test.ts              # HTTP integration tests
+│   ├── live-test.ts              # Live server tests
+│   └── direct-test.ts            # Component unit tests
 └── nvim/                         # Neovim plugin (TODO)
     └── lua/
         └── suggestion-review/
             ├── init.lua          # Main module
-            ├── client.lua        # SSE client for events
+            ├── client.lua        # WebSocket client
             ├── ui.lua            # Review UI components
-            ├── feedback.lua      # Send feedback to sandbox
+            ├── feedback.lua      # Send feedback
             └── config.lua        # Configuration handling
 
 # Deployment locations
 ~/.config/opencode/plugin/
-└── suggestion-manager.ts         # Symlink or copy of built plugin
+├── suggestion-manager-src/       # Symlink to plugin/src
+└── suggestion-manager.ts         # Symlink to loader.ts
 ```
 
 ## Implementation Status
@@ -566,9 +663,13 @@ tool({
 2. ~~Implement OpenCode plugin (suggestion-manager)~~
    - Unified diff parser with full test coverage
    - Suggestion state management
-   - Event emission via app.log() API
+   - Event emission via app.log() API + WebSocket broadcast
    - Patch applier for applying hunks to files
    - All 6 tools implemented: publish_suggestion, suggestion_feedback, suggestion_status, list_suggestions, complete_suggestion, get_suggestion
+   - HTTP server with REST endpoints
+   - WebSocket server for real-time bidirectional communication
+   - AI notification via session prompt injection
+   - Revert-on-reject: rejected hunks are automatically reverted
 
 ### Remaining
 
@@ -583,10 +684,11 @@ tool({
 The plugin is structured as follows:
 
 - **types.ts**: All TypeScript interfaces for events, suggestions, hunks, feedback
-- **diff-parser.ts**: Parses `jj diff` output into structured hunks
+- **diff-parser.ts**: Parses `jj diff --git` output into structured hunks
 - **suggestion-store.ts**: In-memory store for pending suggestions with feedback logging
-- **event-emitter.ts**: Emits events via OpenCode's app.log() API
-- **patch-applier.ts**: Applies unified diff hunks to files
+- **event-emitter.ts**: Emits events via WebSocket broadcast + OpenCode's app.log() API
+- **patch-applier.ts**: Applies unified diff hunks to files, supports reversal for undo
+- **http-server.ts**: HTTP + WebSocket server for client communication
 - **index.ts**: Main plugin that exposes tools to the AI
 
 ### Applying Hunks
@@ -614,11 +716,18 @@ jj log -r @ --no-graph -T 'change_id'
 jj git push
 ```
 
-### SSE Event Emission
+### Event Broadcasting
 
-Events are emitted via OpenCode's app.log() API with a convention:
+Events are broadcast via two channels:
+
+1. **WebSocket** (primary): All connected clients receive events immediately
+2. **OpenCode SSE** (fallback): Events also logged via app.log() API for SSE filtering
 
 ```typescript
+// WebSocket broadcast (primary)
+broadcast(event);  // Sends to all connected WebSocket clients
+
+// SSE fallback
 await client.app.log({
   body: {
     service: "suggestion-manager",
@@ -629,7 +738,21 @@ await client.app.log({
 })
 ```
 
-The neovim plugin filters the SSE stream for logs from "suggestion-manager" service with `extra.event: true`.
+### AI Notification
+
+When feedback is received, the AI is notified via session prompt injection:
+
+```typescript
+await client.session.prompt({
+  path: { id: sessionId },
+  body: {
+    noReply: true,
+    parts: [{ type: "text", text: "[Suggestion Feedback] User accepted hunk in file.ts..." }]
+  }
+})
+```
+
+This allows the AI to see feedback immediately in the conversation.
 
 ### Running Tests
 
@@ -638,4 +761,19 @@ cd plugin
 bun test           # Run all tests
 bun test --watch   # Watch mode
 bun run typecheck  # Type checking
+
+# Test WebSocket connection
+cd test-harness
+bun run ws-test.ts # Connect to WebSocket, list suggestions, listen for events
+
+# Test HTTP endpoints
+curl http://127.0.0.1:4097/health
+curl http://127.0.0.1:4097/suggestions
 ```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SUGGESTION_MANAGER_PORT` | `4097` | HTTP + WebSocket server port |
+| `SUGGESTION_MANAGER_HOST` | `127.0.0.1` | Server bind address |

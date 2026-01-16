@@ -34,6 +34,7 @@ export class SuggestionStore {
     description: string;
     files: string[];
     hunks: Hunk[];
+    workingDirectory: string;
   }): Suggestion {
     const suggestion: Suggestion = {
       id: params.id,
@@ -44,6 +45,7 @@ export class SuggestionStore {
       status: "pending",
       createdAt: Date.now(),
       hunkStates: new Map(),
+      workingDirectory: params.workingDirectory,
     };
 
     // Initialize hunk states
@@ -81,7 +83,7 @@ export class SuggestionStore {
   }
 
   /**
-   * Update hunk state after feedback
+   * Update hunk state after feedback and remove the hunk from the suggestion
    */
   updateHunkState(
     suggestionId: string,
@@ -92,24 +94,12 @@ export class SuggestionStore {
     const suggestion = this.suggestions.get(suggestionId);
     if (!suggestion) return false;
 
-    const hunk = suggestion.hunks.find((h) => h.id === hunkId);
-    if (!hunk) return false;
+    const hunkIndex = suggestion.hunks.findIndex((h) => h.id === hunkId);
+    if (hunkIndex === -1) return false;
+    
+    const hunk = suggestion.hunks[hunkIndex];
 
-    const state: HunkState = {
-      reviewed: true,
-      action: feedback.action === "accept" ? "accepted" : 
-              feedback.action === "reject" ? "rejected" : "modified",
-      modifiedDiff: feedback.modifiedDiff,
-      comment: feedback.comment,
-      appliedAt: applied ? Date.now() : undefined,
-    };
-
-    suggestion.hunkStates.set(hunkId, state);
-
-    // Update suggestion status
-    this.updateSuggestionStatus(suggestionId);
-
-    // Log feedback
+    // Log feedback before removing
     this.logFeedback({
       timestamp: Date.now(),
       suggestionId,
@@ -122,75 +112,68 @@ export class SuggestionStore {
       applied,
     });
 
+    // Remove the hunk from the suggestion
+    suggestion.hunks.splice(hunkIndex, 1);
+    suggestion.hunkStates.delete(hunkId);
+    
+    // Update files list (remove file if no more hunks reference it)
+    const remainingFiles = new Set(suggestion.hunks.map(h => h.file));
+    suggestion.files = suggestion.files.filter(f => remainingFiles.has(f));
+
+    // Update suggestion status
+    if (suggestion.hunks.length === 0) {
+      suggestion.status = "complete";
+    } else {
+      suggestion.status = "partial";
+    }
+
     return true;
   }
 
   /**
-   * Update suggestion status based on hunk states
-   */
-  private updateSuggestionStatus(suggestionId: string): void {
-    const suggestion = this.suggestions.get(suggestionId);
-    if (!suggestion) return;
-
-    const totalHunks = suggestion.hunks.length;
-    let reviewedCount = 0;
-
-    for (const state of suggestion.hunkStates.values()) {
-      if (state.reviewed) {
-        reviewedCount++;
-      }
-    }
-
-    if (reviewedCount === 0) {
-      suggestion.status = "pending";
-    } else if (reviewedCount < totalHunks) {
-      suggestion.status = "partial";
-    } else {
-      suggestion.status = "complete";
-    }
-  }
-
-  /**
-   * Get count of reviewed hunks
-   */
-  getReviewedCount(suggestionId: string): number {
-    const suggestion = this.suggestions.get(suggestionId);
-    if (!suggestion) return 0;
-
-    let count = 0;
-    for (const state of suggestion.hunkStates.values()) {
-      if (state.reviewed) {
-        count++;
-      }
-    }
-    return count;
-  }
-
-  /**
-   * Get count of remaining (unreviewed) hunks
+   * Get count of remaining (pending) hunks
    */
   getRemainingCount(suggestionId: string): number {
     const suggestion = this.suggestions.get(suggestionId);
     if (!suggestion) return 0;
 
-    return suggestion.hunks.length - this.getReviewedCount(suggestionId);
+    return suggestion.hunks.length;
   }
 
   /**
-   * List all suggestions
+   * List all suggestions, optionally filtered by working directory
+   * Only returns suggestions with pending hunks
    */
-  listSuggestions(): ListSuggestionsResult {
+  listSuggestions(workingDirectory?: string): ListSuggestionsResult {
     const suggestions: ListSuggestionsResult["suggestions"] = [];
 
     for (const suggestion of this.suggestions.values()) {
+      // Skip suggestions with no remaining hunks
+      if (suggestion.hunks.length === 0) {
+        continue;
+      }
+      
+      // Filter by working directory if specified
+      // Match if either ends with the other (handles relative vs absolute paths)
+      if (workingDirectory && suggestion.workingDirectory) {
+        const suggestionDir = suggestion.workingDirectory;
+        const matches = suggestionDir === workingDirectory ||
+          suggestionDir.endsWith("/" + workingDirectory) ||
+          workingDirectory.endsWith("/" + suggestionDir);
+        if (!matches) {
+          continue;
+        }
+      }
+      
       suggestions.push({
         id: suggestion.id,
         jjChangeId: suggestion.jjChangeId,
         description: suggestion.description,
         files: suggestion.files,
         hunkCount: suggestion.hunks.length,
-        reviewedCount: this.getReviewedCount(suggestion.id),
+        reviewedCount: 0, // Hunks are removed when reviewed, so remaining = hunkCount
         status: suggestion.status,
+        workingDirectory: suggestion.workingDirectory,
       });
     }
 

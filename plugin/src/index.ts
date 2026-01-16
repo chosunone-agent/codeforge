@@ -1,5 +1,5 @@
 /**
- * Suggestion Manager - OpenCode Plugin
+ * CodeForge - OpenCode Plugin
  * 
  * Enables AI to publish code suggestions for hunk-by-hunk review.
  * Works with jj (Jujutsu) for version control.
@@ -57,7 +57,7 @@ async function getCurrentChangeId($: any): Promise<string> {
 /**
  * The main plugin export
  */
-export const SuggestionManagerPlugin: Plugin = async ({ client, directory, $ }) => {
+export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
   // Initialize global state
   store = new SuggestionStore({
     feedbackLogPath: `${directory}/.opencode/suggestion-feedback.jsonl`,
@@ -110,13 +110,19 @@ export const SuggestionManagerPlugin: Plugin = async ({ client, directory, $ }) 
               });
             }
 
-            // Create the suggestion
+            // Create the suggestion with relative working directory (relative to home)
+            const homeDir = process.env.HOME || process.env.USERPROFILE || "";
+            const relativeWorkingDir = workingDirectory.startsWith(homeDir) 
+              ? workingDirectory.slice(homeDir.length + 1)  // +1 for the slash
+              : workingDirectory;
+            
             const suggestion = store.createSuggestion({
               id: suggestionId,
               jjChangeId: changeId,
               description: args.description,
               files,
               hunks,
+              workingDirectory: relativeWorkingDir,
             });
 
             // Emit the ready event
@@ -255,11 +261,9 @@ export const SuggestionManagerPlugin: Plugin = async ({ client, directory, $ }) 
 
             // Emit status update
             const remaining = store.getRemainingCount(args.suggestion_id);
-            const reviewed = store.getReviewedCount(args.suggestion_id);
-            const total = suggestion.hunks.length;
             await emitter.emitStatus(
               remaining === 0 ? "applied" : "partial",
-              `${reviewed}/${total} hunks reviewed`,
+              `${remaining} hunks remaining`,
               args.suggestion_id
             );
 
@@ -430,7 +434,6 @@ export const SuggestionManagerPlugin: Plugin = async ({ client, directory, $ }) 
                 status: suggestion.status,
                 createdAt: suggestion.createdAt,
                 hunkStates,
-                reviewedCount: store.getReviewedCount(args.suggestion_id),
                 remainingCount: store.getRemainingCount(args.suggestion_id),
               },
             });
@@ -449,11 +452,11 @@ export const SuggestionManagerPlugin: Plugin = async ({ client, directory, $ }) 
       if (httpServer) {
         httpServer.stop();
         httpServer = null;
-        console.log("[suggestion-manager] HTTP server stopped");
+        console.log("[codeforge] HTTP server stopped");
       }
     },
   };
 };
 
 // Default export for OpenCode plugin loading
-export default SuggestionManagerPlugin;
+export default CodeForgePlugin;

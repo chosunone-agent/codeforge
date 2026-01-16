@@ -184,10 +184,14 @@ export function fileDiffsToHunks(fileDiffs: FileDiff[], suggestionId: string): H
   for (const fileDiff of fileDiffs) {
     for (let i = 0; i < fileDiff.hunks.length; i++) {
       const parsedHunk = fileDiff.hunks[i]!;
+      const { original } = extractHunkContent(parsedHunk.content);
+      
       hunks.push({
         id: `${suggestionId}:${fileDiff.newPath}:${i}`,
         file: fileDiff.newPath,
         diff: parsedHunk.content,
+        originalLines: original,
+        originalStartLine: parsedHunk.oldStart,
       });
     }
   }

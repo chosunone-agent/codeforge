@@ -1,0 +1,36 @@
+function greet(name) {
+  console.log(`Hello, ${name}!`);
+}
+
+function add(a, b) {
+  // Add two numbers together
+  return a + b;
+}
+
+function multiply(a, b) {
+  // Multiply two numbers
+  return a * b;
+}
+
+function subtract(a, b) {
+  // Subtract b from a
+  return a - b;
+}
+
+function divide(a, b) {
+  // Divide a by b
+  if (b === 0) throw new Error("Cannot divide by zero");
+  return a / b;
+}
+
+function modulo(a, b) {
+  // Get remainder of a divided by b
+  return a % b;
+}
+
+// Demo
+greet("World");
+console.log(add(2, 3));
+console.log(multiply(4, 5));
+console.log(subtract(10, 3));
+console.log(divide(20, 4));

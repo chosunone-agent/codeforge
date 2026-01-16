@@ -1,5 +1,5 @@
 /**
- * Type definitions for the suggestion-manager plugin
+ * Type definitions for the CodeForge plugin
  * Based on the protocol specification in DESIGN.md
  */
 
@@ -17,6 +17,10 @@ export interface Hunk {
   file: string;
   /** Unified diff format for this hunk (includes @@ line numbers, context, +/- lines) */
   diff: string;
+  /** Original content of the affected lines (before the change was applied) */
+  originalLines?: string[];
+  /** Start line number in the original file (1-indexed) */
+  originalStartLine?: number;
 }
 
 /**
@@ -39,6 +43,8 @@ export interface Suggestion {
   createdAt: number;
   /** Review state for each hunk */
   hunkStates: Map<string, HunkState>;
+  /** Working directory where this suggestion was created (for project scoping) */
+  workingDirectory: string;
 }
 
 export type SuggestionStatus = "pending" | "partial" | "complete" | "discarded";
@@ -63,6 +69,7 @@ export interface SuggestionReadyEvent {
     description: string;
     files: string[];
     hunks: Hunk[];
+    workingDirectory?: string;
   };
 }
 
@@ -168,5 +175,6 @@ export interface ListSuggestionsResult {
     hunkCount: number;
     reviewedCount: number;
     status: SuggestionStatus;
+    workingDirectory?: string;
   }>;
 }
