@@ -105,9 +105,13 @@ let httpServer: ReturnType<typeof Bun.serve> | null = null;
  */
 async function getJjDiff($: any, changeId?: string): Promise<string> {
   try {
-    const args = changeId ? ["-r", changeId, "--git"] : ["--git"];
-    const result = await $`jj diff ${args}`.text();
-    return result;
+    if (changeId) {
+      const result = await $`jj diff -r ${changeId} --git`.text();
+      return result;
+    } else {
+      const result = await $`jj diff --git`.text();
+      return result;
+    }
   } catch (error) {
     throw new Error(`Failed to get jj diff: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -118,7 +122,7 @@ async function getJjDiff($: any, changeId?: string): Promise<string> {
  */
 async function getCurrentChangeId($: any): Promise<string> {
   try {
-    const result = await $`jj log -r @ --no-graph -T 'change_id'`.text();
+    const result = await $`jj log -r @ --no-graph -T change_id`.text();
     return result.trim();
   } catch (error) {
     throw new Error(`Failed to get current change ID: ${error instanceof Error ? error.message : String(error)}`);

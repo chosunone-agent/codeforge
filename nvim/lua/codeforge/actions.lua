@@ -82,6 +82,16 @@ local function apply_hunk_locally(file_path, diff)
     if vim.api.nvim_buf_is_loaded(b) then
       local buf_name = vim.api.nvim_buf_get_name(b)
       if buf_name == full_path then
+        -- Skip shadow buffers (they have the real file path but are marked)
+        local is_shadow = pcall(function()
+          return vim.api.nvim_buf_get_var(b, "codeforge_shadow")
+        end)
+        if not is_shadow then
+          bufnr = b
+          break
+        end
+      elseif buf_name == full_path .. "#original" then
+        -- Found the original buffer that was renamed by shadow buffer
         bufnr = b
         break
       end
