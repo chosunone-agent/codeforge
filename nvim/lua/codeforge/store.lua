@@ -255,6 +255,12 @@ function M.get_hunk_state(hunk_id)
   return state.hunk_states[hunk_id]
 end
 
+---Get all hunk states
+---@return table<string, HunkState>
+function M.get_hunk_states()
+  return state.hunk_states
+end
+
 ---Set hunk state and remove from suggestion if reviewed
 ---@param hunk_id string
 ---@param status "pending" | "accepted" | "rejected" | "modified"

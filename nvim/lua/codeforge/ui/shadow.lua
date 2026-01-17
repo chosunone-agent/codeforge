@@ -629,25 +629,34 @@ function M.open(hunk, working_dir)
   
   local showing_diff_only = false
   
-  -- Calculate line offset from previous hunks in the same suggestion
+  -- Calculate line offset from previous ACCEPTED/MODIFIED hunks in the same suggestion
   local suggestion = store.get_suggestion_by_hunk_id and store.get_suggestion_by_hunk_id(hunk.id)
   local adjusted_diff = hunk.diff
   local offset = 0
   if suggestion then
-    local found_current = false
+    -- Get all hunk states to find accepted/modified hunks
+    local hunk_states = store.get_hunk_states and store.get_hunk_states() or {}
     
     for _, prev_hunk in ipairs(suggestion.hunks) do
       if prev_hunk.file == hunk.file then
         if prev_hunk.id == hunk.id then
-          found_current = true
           break
         end
         
-        -- Only count hunks that come before the current hunk
-        if not found_current then
-          local header = diff_utils.parse_hunk_header(prev_hunk.diff:match("^[^\n]+"))
-          if header then
-            offset = offset + (header.new_count - header.old_count)
+        -- Check if this previous hunk was accepted or modified
+        local hunk_state = hunk_states[prev_hunk.id]
+        if hunk_state and (hunk_state.status == "accepted" or hunk_state.status == "modified") then
+          if hunk_state.status == "modified" and hunk_state.modifiedContent then
+            -- For modified hunks, calculate actual size change
+            local original_size = #prev_hunk.originalLines
+            local modified_size = #hunk_state.modifiedContent
+            offset = offset + (modified_size - original_size)
+          else
+            -- For accepted hunks, use the original diff size
+            local header = diff_utils.parse_hunk_header(prev_hunk.diff:match("^[^\n]+"))
+            if header then
+              offset = offset + (header.new_count - header.old_count)
+            end
           end
         end
       end

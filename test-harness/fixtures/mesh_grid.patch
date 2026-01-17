@@ -1,0 +1,267 @@
+index 58fcdfff1c..f662d848e2 100644
+--- a/src/resources/mesh_grid.rs
++++ b/src/resources/mesh_grid.rs
+@@ -10,6 +10,7 @@
+ };
+ use hexasphere::shapes::IcoSphere;
+ use sprs::{CsMat, CsVec, TriMat};
++use sprs_ldl::LdlNumeric;
+
+ use crate::constants::SPHERE_RADIUS;
+
+@@ -604,8 +605,14 @@
+             });
+         }
+
+-        // let edge_transport_connection = Self::calculate_trivial_connection(grid, &[]);
+-        let edge_transport_connection = vec![];
++        let north_pole_idx = Self::find_north_pole_vertex(&sphere);
++        let edge_transport_connection = Self::calculate_trivial_connection(
++            &sphere,
++            &edge_vertex_adjacency,
++            &vertex_edge_adjacency,
++            &cell_edge_adjacency,
++            &[(north_pole_idx, 2)],
++        );
+
+         Self {
+             cell_adjacency,
+@@ -643,26 +650,30 @@
+         mesh
+     }
+
+-    fn calculate_trivial_connection(grid: &MeshGrid, singularities: &[(usize, usize)]) -> Vec<f32> {
+-        let d0 = Self::build_d0(
+-            grid.edge_vertex_adjacency(),
+-            grid.vertex_edge_adjacency().len(),
+-        );
+-        let d1 = Self::build_d1(
+-            grid.cell_edge_adjacency(),
+-            grid.edge_vertex_adjacency(),
+-            grid.sphere(),
+-        );
++    fn calculate_trivial_connection(
++        sphere: &IcoSphere<Vec3A>,
++        edge_vertex_adjacency: &Adjacency<EdgeVertex>,
++        vertex_edge_adjacency: &Adjacency<VertexEdge>,
++        cell_edge_adjacency: &Adjacency<CellEdge>,
++        singularities: &[(usize, usize)],
++    ) -> Vec<f32> {
++        if singularities.is_empty() {
++            panic!("Singularities must not be empty");
++        }
++
++        let d0 = Self::build_d0(edge_vertex_adjacency, vertex_edge_adjacency.len());
++        let d1 = Self::build_d1(cell_edge_adjacency, edge_vertex_adjacency, sphere);
+         let curvature = Self::calculate_gaussian_curvature(
+-            grid.sphere(),
+-            grid.vertex_edge_adjacency(),
+-            grid.edge_vertex_adjacency(),
++            sphere,
++            vertex_edge_adjacency,
++            edge_vertex_adjacency,
+         );
+
+         let num_vertices = curvature.len();
+-        let num_edges = grid.edge_vertex_adjacency().len();
++        let num_edges = edge_vertex_adjacency.len();
++        let num_cells = cell_edge_adjacency.len();
+
+-        let mut rhs_data = vec![0.0; num_vertices];
++        let mut rhs_data = vec![0.0f64; num_vertices];
+         for i in 0..num_vertices {
+             rhs_data[i] = -curvature[i];
+         }
+@@ -671,9 +682,67 @@
+             rhs_data[vertex_idx] += TAU * (index as f64);
+         }
+
+-        let rhs = CsVec::new(num_vertices, (0..num_vertices).collect(), rhs_data);
+-        todo!();
+-        vec![]
++        let d0_t = d0.transpose_view();
++        let a = &d0_t * &d0;
++
++        let north_pole_idx = Self::find_north_pole_vertex(sphere);
++        let (a_reduced, rhs_reduced) =
++            Self::remove_vertex_from_system(&a, &rhs_data, north_pole_idx);
++
++        let a_reduced_csc = a_reduced.to_other_storage();
++        let ldl =
++            LdlNumeric::new(a_reduced_csc.view()).expect("LDL decomposition failed for A_reduced");
++
++        let lambda_vec = ldl.solve(&rhs_reduced);
++
++        let mut lambda = vec![0.0f64; num_vertices];
++        lambda[north_pole_idx] = 0.0;
++        for (i, &val) in lambda_vec.iter().enumerate() {
++            let target_idx = if i >= north_pole_idx { i + 1 } else { i };
++            lambda[target_idx] = val;
++        }
++
++        let lambda_csvec = CsVec::new(num_vertices, (0..num_vertices).collect(), lambda);
++        let phi_tilde_vec = &d0 * &lambda_csvec;
++
++        let mut phi_tilde = vec![0.0f64; num_edges];
++        for (idx, &val) in phi_tilde_vec.iter() {
++            phi_tilde[idx] = -val;
++        }
++
++        let d1_csc = d1.to_other_storage();
++        let d1_t = d1_csc.transpose_view();
++        let b_matrix = &d1_csc * &d1_t;
++
++        let phi_tilde_csvec = CsVec::new(num_edges, (0..num_edges).collect(), phi_tilde.clone());
++        let b_rhs = &d1_csc * &phi_tilde_csvec;
++
++        let mut b_rhs_dense = vec![0.0f64; num_cells];
++        for (idx, &val) in b_rhs.iter() {
++            b_rhs_dense[idx] = val;
++        }
++
++        let ldl_b =
++            LdlNumeric::new(b_matrix.view()).expect("LDL decomposition failed for B matrix");
++
++        let psi_vec = ldl_b.solve(&b_rhs_dense);
++
++        let psi_csvec = CsVec::new(num_cells, (0..num_cells).collect(), psi_vec);
++        let projection_vec = &d1_t * &psi_csvec;
++
++        let mut projection = vec![0.0f64; num_edges];
++        for (idx, &val) in projection_vec.iter() {
++            projection[idx] = val;
++        }
++
++        let mut phi_hat = vec![0.0f64; num_edges];
++        for i in 0..num_edges {
++            phi_hat[i] = phi_tilde[i] - projection[i];
++        }
++
++        Self::fix_north_pole_edges(&mut phi_hat, edge_vertex_adjacency, north_pole_idx);
++
++        phi_hat.iter().map(|&x| x as f32).collect()
+     }
+
+     fn calculate_gaussian_curvature(
+@@ -770,6 +839,59 @@
+
+         d1_triplet.to_csr()
+     }
++
++    fn find_north_pole_vertex(sphere: &IcoSphere<Vec3A>) -> usize {
++        sphere
++            .raw_points()
++            .iter()
++            .enumerate()
++            .max_by(|(_, p1), (_, p2)| p1.y.partial_cmp(&p2.y).unwrap_or(std::cmp::Ordering::Equal))
++            .map(|(idx, _)| idx)
++            .expect("Could not find north pole vertex")
++    }
++
++    fn remove_vertex_from_system(
++        a: &CsMat<f64>,
++        b: &[f64],
++        vertex_idx: usize,
++    ) -> (CsMat<f64>, Vec<f64>) {
++        let n = a.cols() - 1;
++        let mut a_triplet = TriMat::new((n, n));
++        let mut new_b = Vec::with_capacity(n);
++
++        for row in 0..a.rows() {
++            if row == vertex_idx {
++                continue;
++            }
++            new_b.push(b[row]);
++
++            let row_vec = a.outer_view(row).expect("Row should exist");
++            for (col_idx, &val) in row_vec.indices().iter().zip(row_vec.data().iter()) {
++                if *col_idx == vertex_idx {
++                    continue;
++                }
++                let new_row = if row > vertex_idx { row - 1 } else { row };
++                let new_col = if *col_idx > vertex_idx {
++                    *col_idx - 1
++                } else {
++                    *col_idx
++                };
++                a_triplet.add_triplet(new_row, new_col, val);
++            }
++        }
++
++        (a_triplet.to_csr(), new_b)
++    }
++
++    fn fix_north_pole_edges(
++        phi: &mut [f64],
++        edge_vertex_adjacency: &Adjacency<EdgeVertex>,
++        north_pole_idx: usize,
++    ) {
++        for edge_idx in edge_vertex_adjacency.get(north_pole_idx) {
++            phi[edge_idx] = 0.0;
++        }
++    }
+ }
+
+ #[cfg(test)]
+@@ -778,34 +900,34 @@
+
+     #[test]
+     fn it_calculates_curvature() {
+-        let grid = MeshGrid::new(100);
++        let grid = MeshGridInner::new(10);
+         let curvature = MeshGridInner::calculate_gaussian_curvature(
+-            grid.sphere(),
+-            grid.vertex_edge_adjacency(),
+-            grid.edge_vertex_adjacency(),
++            &grid.sphere,
++            &grid.vertex_edge_adjacency,
++            &grid.edge_vertex_adjacency,
+         );
+
+         let total_curvature = curvature.iter().fold(0.0, |acc, &x| acc + x);
+
+         assert!(
+-            (total_curvature - 2.0 * TAU64).abs() < 1.5e-3,
++            (total_curvature - 2.0 * TAU).abs() < 1.5e-3,
+             "{}",
+-            (total_curvature - 2.0 * TAU64).abs()
++            (total_curvature - 2.0 * TAU).abs()
+         );
+     }
+
+     #[test]
+     fn it_is_zero_when_applying_d_twice() {
+-        let grid = MeshGrid::new(0);
++        let grid = MeshGridInner::new(0);
+
+         let d0 = MeshGridInner::build_d0(
+-            grid.edge_vertex_adjacency(),
+-            grid.vertex_edge_adjacency().len(),
++            &grid.edge_vertex_adjacency,
++            grid.vertex_edge_adjacency.len(),
+         );
+         let d1 = MeshGridInner::build_d1(
+-            grid.cell_edge_adjacency(),
+-            grid.edge_vertex_adjacency(),
+-            grid.sphere(),
++            &grid.cell_edge_adjacency,
++            &grid.edge_vertex_adjacency,
++            &grid.sphere,
+         );
+
+         let product = &d1 * &d0;
+@@ -818,11 +940,11 @@
+
+     #[test]
+     fn it_sums_to_zero_for_d0() {
+-        let grid = MeshGrid::new(0);
++        let grid = MeshGridInner::new(0);
+
+         let d0 = MeshGridInner::build_d0(
+-            grid.edge_vertex_adjacency(),
+-            grid.vertex_edge_adjacency().len(),
++            &grid.edge_vertex_adjacency,
++            grid.vertex_edge_adjacency.len(),
+         );
+
+         for row_vec in d0.outer_iterator() {
