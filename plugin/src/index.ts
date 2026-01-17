@@ -122,9 +122,13 @@ async function getJjDiff($: any, changeId?: string): Promise<string> {
  */
 async function getCurrentChangeId($: any): Promise<string> {
   try {
-    const result = await $`jj log -r @ --no-graph -T change_id`.text();
+    console.log("[codeforge] Running: jj log -r @ --no-graph -T commit_id");
+    const result = await $`jj log -r @ --no-graph -T commit_id`.text();
+    console.log("[codeforge] Result:", result);
+    console.log("[codeforge] Result length:", result.length);
     return result.trim();
   } catch (error) {
+    console.error("[codeforge] Error:", error);
     throw new Error(`Failed to get current change ID: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
@@ -262,6 +266,7 @@ export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
               : defaultExcludeFiles;
             
             // Apply filters (always apply default exclude)
+            const hasFilters = args.files || args.exclude_files || args.line_ranges;
             const filterOptions: FilterOptions = {
               includeFiles: args.files,
               excludeFiles,
@@ -277,7 +282,7 @@ export const CodeForgePlugin: Plugin = async ({ client, directory, $ }) => {
             const suggestionId = generateSuggestionId();
             let hunks = fileDiffsToHunks(fileDiffs, suggestionId);
             const files = [...new Set(fileDiffs.map(fd => fd.newPath !== "/dev/null" ? fd.newPath : fd.oldPath))];
-
+            
             if (hunks.length === 0) {
               const filterMsg = hasFilters ? " (after applying filters)" : "";
               return JSON.stringify({
